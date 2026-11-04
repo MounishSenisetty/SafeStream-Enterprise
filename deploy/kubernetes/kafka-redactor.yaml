@@ -1,0 +1,76 @@
+# SafeStream Enterprise: Kafka redaction connector.
+# Consumes ingress-logs, publishes egress-logs-clean. Scale replicas up to the
+# ingress topic's partition count; extra replicas sit idle in the group.
+#
+#   kubectl create secret generic safestream-secrets \
+#     --from-literal=hmac-key="$(openssl rand -hex 32)" \
+#     --from-literal=sasl-username=... --from-literal=sasl-password=...
+#   kubectl apply -f deploy/kubernetes/kafka-redactor.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: safestream-kafka-redactor
+  labels: { app: safestream-kafka-redactor }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: safestream-kafka-redactor }
+  template:
+    metadata:
+      labels: { app: safestream-kafka-redactor }
+    spec:
+      # Time to drain the in-flight batch and commit after SIGTERM.
+      terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: redactor
+          image: ghcr.io/mounishsenisetty/safestream-enterprise:0.1.0
+          env:
+            - { name: KAFKA_BOOTSTRAP_SERVERS, value: "kafka-bootstrap.kafka.svc:9093" }
+            - { name: KAFKA_GROUP_ID, value: "safestream-redactor" }
+            - { name: INGRESS_TOPIC, value: "ingress-logs" }
+            - { name: EGRESS_TOPIC, value: "egress-logs-clean" }
+            - { name: DLQ_TOPIC, value: "ingress-logs-dlq" }
+            - { name: SAFESTREAM_MODE, value: "pseudonymize" }
+            - name: SAFESTREAM_HMAC_KEY
+              valueFrom: { secretKeyRef: { name: safestream-secrets, key: hmac-key } }
+            # Any librdkafka property: SAFESTREAM_KAFKA_<PROP with . as _>
+            - { name: SAFESTREAM_KAFKA_SECURITY_PROTOCOL, value: "SASL_SSL" }
+            - { name: SAFESTREAM_KAFKA_SASL_MECHANISM, value: "SCRAM-SHA-512" }
+            - name: SAFESTREAM_KAFKA_SASL_USERNAME
+              valueFrom: { secretKeyRef: { name: safestream-secrets, key: sasl-username } }
+            - name: SAFESTREAM_KAFKA_SASL_PASSWORD
+              valueFrom: { secretKeyRef: { name: safestream-secrets, key: sasl-password } }
+          resources:
+            # Memory is flat: one batch of records at a time, independent of topic volume.
+            requests: { cpu: "500m", memory: "256Mi" }
+            limits: { cpu: "2", memory: "512Mi" }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+# Egress lockdown: the pod may reach DNS and the Kafka brokers, nothing else.
+# The OSS in-process network guard can't be used here (the connector must talk
+# to Kafka), so the boundary is enforced by the cluster instead.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: safestream-kafka-redactor-egress
+spec:
+  podSelector:
+    matchLabels: { app: safestream-kafka-redactor }
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kafka }
+      ports: [{ protocol: TCP, port: 9093 }]
+    - to:
+        - namespaceSelector:
+            matchLabels: { kubernetes.io/metadata.name: kube-system }
+      ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]

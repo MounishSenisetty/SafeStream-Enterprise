@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "safestream-enterprise"
+dynamic = ["version"]
+description = "Schema-aware PII & secret redaction for enterprise data pipelines, built on safestream-redactor."
+readme = "README.md"
+license = "LicenseRef-Proprietary"
+requires-python = ">=3.10"
+authors = [{ name = "Mounish Senisetty" }]
+classifiers = [
+  "Private :: Do Not Upload",
+  "Programming Language :: Python :: 3",
+  "Topic :: Security",
+  "Typing :: Typed",
+]
+dependencies = [
+  # The open-source engine: detection tiers, redaction policies, streaming core.
+  # Pinned to the minor series whose public API (Redactor, RedactionPolicy,
+  # Detection, RedactionStats) this package is written against.
+  "safestream-redactor>=0.4.0,<0.5",
+]
+
+[project.optional-dependencies]
+# Kafka sidecar/consumer (connectors/kafka.py). librdkafka ships inside the wheel.
+kafka = ["confluent-kafka>=2.3,<3"]
+dev = ["pytest>=7", "mypy>=1.8", "ruff>=0.15,<0.16", "confluent-kafka>=2.3,<3"]
+
+[project.scripts]
+safestream-kafka = "safestream_enterprise.connectors.kafka:main"
+
+[tool.hatch.version]
+path = "src/safestream_enterprise/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/safestream_enterprise"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+
+[[tool.mypy.overrides]]
+# confluent-kafka ships partial stubs; tolerate gaps rather than vendoring our own.
+module = ["confluent_kafka", "confluent_kafka.*"]
+ignore_missing_imports = true
