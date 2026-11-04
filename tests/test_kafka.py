@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import json
+import os
 from typing import Any
 
 import pytest
 from confluent_kafka import TIMESTAMP_CREATE_TIME, KafkaError, KafkaException
+from pydantic import ValidationError
 
 from safestream_enterprise import StructuredRedactor
 from safestream_enterprise.connectors.kafka import (
     ConnectorConfig,
     DeliveryError,
     KafkaRedactionConnector,
+    main,
 )
 
 
@@ -129,7 +132,7 @@ def test_delivery_failure_never_commits() -> None:
 
 def test_redaction_crash_goes_to_dlq_not_egress() -> None:
     class Boom:
-        def redact_line(self, *_a: Any) -> Any:
+        def redact_line(self, *_a: Any, **_kw: Any) -> Any:
             raise RuntimeError("secret-bearing message")
 
     p = FakeProducer()
@@ -138,6 +141,46 @@ def test_redaction_crash_goes_to_dlq_not_egress() -> None:
     (sent,) = p.sent
     assert sent["topic"] == "ingress-logs-dlq" and sent["value"] == b"raw pii"
     assert sent["headers"] == [("x-safestream-error", b"RuntimeError")]
+    assert c.commits == 1
+
+
+def test_non_json_payload_goes_to_dlq_and_loop_continues() -> None:
+    p = FakeProducer()
+    conn, c = make(p)
+    conn.process_batch([FakeMsg(b"plain text bob@corp.example"), FakeMsg(b'{"ok": 1}')])  # type: ignore[list-item]
+    dlq, egress = p.sent
+    assert dlq["topic"] == "ingress-logs-dlq"
+    assert dlq["headers"] == [("x-safestream-error", b"StructuredParseError")]
+    assert egress["topic"] == "egress-logs-clean"
+    assert c.commits == 1
+
+
+def test_non_json_can_be_text_redacted_instead() -> None:
+    p = FakeProducer()
+    consumer = FakeConsumer()
+    conn = KafkaRedactionConnector(
+        ConnectorConfig(bootstrap_servers="x", non_json="redact_text"),
+        StructuredRedactor(),
+        consumer,
+        p,  # type: ignore[arg-type]
+    )
+    conn.process_batch([FakeMsg(b"plain text bob@corp.example")])  # type: ignore[list-item]
+    (sent,) = p.sent
+    assert sent["topic"] == "egress-logs-clean" and sent["value"] == b"plain text [REDACTED]"
+    assert sent["headers"] == [("x-safestream-redaction", b"text")]
+
+
+def test_egress_produce_rejection_goes_to_dlq() -> None:
+    class Rejecting(FakeProducer):
+        def produce(self, topic: str, **kw: Any) -> None:
+            if topic == "egress-logs-clean":
+                raise KafkaException(KafkaError(KafkaError.MSG_SIZE_TOO_LARGE))
+            super().produce(topic, **kw)
+
+    p = Rejecting()
+    conn, c = make(p)
+    conn.process_batch([FakeMsg(b'{"a": 1}')])  # type: ignore[list-item]
+    assert [m["topic"] for m in p.sent] == ["ingress-logs-dlq"]
     assert c.commits == 1
 
 
@@ -160,5 +203,36 @@ def test_config_from_env() -> None:
     assert cfg.consumer_config()["security.protocol"] == "SASL_SSL"
     assert cfg.producer_config()["sasl.mechanism"] == "SCRAM-SHA-512"
     assert cfg.consumer_config()["enable.auto.commit"] is False
+    assert "SCRAM" not in repr(cfg)  # secrets stay wrapped
     with pytest.raises(ValueError):
         ConnectorConfig.from_env({})
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {"DLQ_TOPIC": "egress-logs-clean"},  # raw records into the clean topic
+        {"EGRESS_TOPIC": "ingress-logs"},  # infinite loop
+        {"SAFESTREAM_MODE": "pseudonymize"},  # no HMAC key
+        {"SAFESTREAM_BATCH_SIZE": "0"},
+        {"SAFESTREAM_NON_JSON": "drop"},
+    ],
+)
+def test_config_rejects_unsafe_values(env: dict[str, str]) -> None:
+    with pytest.raises(ValidationError):
+        ConnectorConfig.from_env({"KAFKA_BOOTSTRAP_SERVERS": "b:9092", **env})
+
+
+def test_main_never_logs_secret_config_values(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        os,
+        "environ",
+        {
+            "KAFKA_BOOTSTRAP_SERVERS": "b:9092",
+            "SAFESTREAM_BATCH_SIZE": "s3cr3t-value",
+        },
+    )
+    assert main() == 2
+    assert "batch_size" in caplog.text and "s3cr3t-value" not in caplog.text

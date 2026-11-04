@@ -1,76 +1,130 @@
 # SafeStream Enterprise: Kafka redaction connector.
-# Consumes ingress-logs, publishes egress-logs-clean. Scale replicas up to the
-# ingress topic's partition count; extra replicas sit idle in the group.
 #
-#   kubectl create secret generic safestream-secrets \
+# Consumes ingress-logs, publishes egress-logs-clean, routes unprocessable
+# records to ingress-logs-dlq. Replicas share one consumer group: scale up to
+# the ingress topic's partition count (extra replicas sit idle).
+#
+#   kubectl create namespace safestream
+#   kubectl -n safestream create secret generic safestream-secrets \
 #     --from-literal=hmac-key="$(openssl rand -hex 32)" \
-#     --from-literal=sasl-username=... --from-literal=sasl-password=...
+#     --from-literal=sasl-username=svc-safestream \
+#     --from-literal=sasl-password='...'
 #   kubectl apply -f deploy/kubernetes/kafka-redactor.yaml
+#
+# Assumes the brokers run in namespace "kafka" with pod label
+# app.kubernetes.io/name=kafka, listening on 9092. Adjust the NetworkPolicy
+# selectors to match your cluster (e.g. strimzi.io/cluster for Strimzi).
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: safestream-kafka-redactor
-  labels: { app: safestream-kafka-redactor }
+  namespace: safestream
+  labels:
+    app.kubernetes.io/name: safestream-kafka-redactor
 spec:
   replicas: 3
   selector:
-    matchLabels: { app: safestream-kafka-redactor }
+    matchLabels:
+      app.kubernetes.io/name: safestream-kafka-redactor
   template:
     metadata:
-      labels: { app: safestream-kafka-redactor }
+      labels:
+        app.kubernetes.io/name: safestream-kafka-redactor
     spec:
-      # Time to drain the in-flight batch and commit after SIGTERM.
+      # Time to finish the in-flight batch, wait for egress acks and commit
+      # after SIGTERM. Must exceed SAFESTREAM_FLUSH_TIMEOUT_S.
       terminationGracePeriodSeconds: 60
+      # The connector never talks to the Kubernetes API.
       automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
-        seccompProfile: { type: RuntimeDefault }
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: redactor
           image: ghcr.io/mounishsenisetty/safestream-enterprise:0.1.0
+          imagePullPolicy: IfNotPresent
           env:
-            - { name: KAFKA_BOOTSTRAP_SERVERS, value: "kafka-bootstrap.kafka.svc:9093" }
-            - { name: KAFKA_GROUP_ID, value: "safestream-redactor" }
-            - { name: INGRESS_TOPIC, value: "ingress-logs" }
-            - { name: EGRESS_TOPIC, value: "egress-logs-clean" }
-            - { name: DLQ_TOPIC, value: "ingress-logs-dlq" }
-            - { name: SAFESTREAM_MODE, value: "pseudonymize" }
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka-bootstrap.kafka.svc.cluster.local:9092"
+            - name: KAFKA_GROUP_ID
+              value: "safestream-redactor"
+            - name: INGRESS_TOPIC
+              value: "ingress-logs"
+            - name: EGRESS_TOPIC
+              value: "egress-logs-clean"
+            - name: DLQ_TOPIC
+              value: "ingress-logs-dlq"
+            # dlq: non-JSON payloads go to the DLQ; redact_text: text-redact them to egress.
+            - name: SAFESTREAM_NON_JSON
+              value: "dlq"
+            - name: SAFESTREAM_MODE
+              value: "pseudonymize"
             - name: SAFESTREAM_HMAC_KEY
-              valueFrom: { secretKeyRef: { name: safestream-secrets, key: hmac-key } }
-            # Any librdkafka property: SAFESTREAM_KAFKA_<PROP with . as _>
-            - { name: SAFESTREAM_KAFKA_SECURITY_PROTOCOL, value: "SASL_SSL" }
-            - { name: SAFESTREAM_KAFKA_SASL_MECHANISM, value: "SCRAM-SHA-512" }
+              valueFrom:
+                secretKeyRef: { name: safestream-secrets, key: hmac-key }
+            # Any librdkafka property: SAFESTREAM_KAFKA_<PROPERTY, dots as underscores>.
+            # Set the protocol to match the 9092 listener (PLAINTEXT, SSL, SASL_SSL).
+            - name: SAFESTREAM_KAFKA_SECURITY_PROTOCOL
+              value: "SASL_SSL"
+            - name: SAFESTREAM_KAFKA_SASL_MECHANISM
+              value: "SCRAM-SHA-512"
             - name: SAFESTREAM_KAFKA_SASL_USERNAME
-              valueFrom: { secretKeyRef: { name: safestream-secrets, key: sasl-username } }
+              valueFrom:
+                secretKeyRef: { name: safestream-secrets, key: sasl-username }
             - name: SAFESTREAM_KAFKA_SASL_PASSWORD
-              valueFrom: { secretKeyRef: { name: safestream-secrets, key: sasl-password } }
+              valueFrom:
+                secretKeyRef: { name: safestream-secrets, key: sasl-password }
           resources:
-            # Memory is flat: one batch of records at a time, independent of topic volume.
+            # Memory is flat: one batch of records at a time, regardless of topic volume.
             requests: { cpu: "500m", memory: "256Mi" }
             limits: { cpu: "2", memory: "512Mi" }
           securityContext:
+            runAsNonRoot: true
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
-            capabilities: { drop: ["ALL"] }
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
 ---
-# Egress lockdown: the pod may reach DNS and the Kafka brokers, nothing else.
-# The OSS in-process network guard can't be used here (the connector must talk
-# to Kafka), so the boundary is enforced by the cluster instead.
+# Default-deny for the connector pods. Selecting a pod with both policy types
+# denies all ingress and all egress not explicitly allowed below, so the only
+# reachable destinations are the Kafka brokers on 9092 and cluster DNS. This is
+# the network boundary the OSS in-process guard can't provide here, because
+# the connector has to reach Kafka.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: safestream-kafka-redactor-egress
+  name: safestream-kafka-redactor
+  namespace: safestream
 spec:
   podSelector:
-    matchLabels: { app: safestream-kafka-redactor }
+    matchLabels:
+      app.kubernetes.io/name: safestream-kafka-redactor
   policyTypes: [Ingress, Egress]
+  # No ingress rules: nothing may connect to the connector (it serves nothing).
   ingress: []
   egress:
+    # Kafka brokers only: namespace AND pod label must both match (same list item).
     - to:
         - namespaceSelector:
-            matchLabels: { kubernetes.io/metadata.name: kafka }
-      ports: [{ protocol: TCP, port: 9093 }]
+            matchLabels:
+              kubernetes.io/metadata.name: kafka
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: kafka
+      ports:
+        - { protocol: TCP, port: 9092 }
+    # Cluster DNS only.
     - to:
         - namespaceSelector:
-            matchLabels: { kubernetes.io/metadata.name: kube-system }
-      ports: [{ protocol: UDP, port: 53 }, { protocol: TCP, port: 53 }]
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }

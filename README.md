@@ -58,8 +58,9 @@ data is removed:
    (validated patterns, checksums, entropy analysis and contextual scoring). This catches
    secrets hidden in free text, such as `"msg": "retrying with key AKIA..."`.
 
-Records that are not JSON are never passed through unchecked. They fall back to full-text
-redaction automatically.
+Records that are not JSON are never passed through unchecked. By default the Kafka
+connector sends them to the dead-letter topic. You can choose to have them text-redacted
+and delivered to the clean topic instead.
 
 **Delivery guarantees.** No record reaches the clean topic unredacted. Offsets are committed
 only after the clean topic acknowledges the data, so a crash replays records and never drops
@@ -148,30 +149,43 @@ with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
 | `DLQ_TOPIC` | `ingress-logs-dlq` | Unprocessable records (restrict its ACLs like the ingress topic) |
 | `SAFESTREAM_MODE` | `replace` | `replace`, `mask` or `pseudonymize` |
 | `SAFESTREAM_HMAC_KEY` | none | Key for consistent pseudonyms (mount from a Secret) |
+| `SAFESTREAM_NON_JSON` | `dlq` | `dlq`: non-JSON payloads go to the DLQ. `redact_text`: they are text-redacted and delivered to egress |
 | `SAFESTREAM_BATCH_SIZE` | `500` | Records per commit |
+| `SAFESTREAM_FLUSH_TIMEOUT_S` | `30` | Maximum wait for egress acknowledgements per batch |
 | `SAFESTREAM_KAFKA_*` | none | Any Kafka client setting, e.g. `SAFESTREAM_KAFKA_SECURITY_PROTOCOL=SASL_SSL` |
 
-Custom field rules, for proprietary schemas:
+Configuration is validated at startup. A bad value, or a dangerous combination such as the
+DLQ topic set to the clean topic, stops the pod immediately with a clear error. Secret values
+never appear in logs.
+
+Custom field rules, for proprietary schemas. A glob matches the key in any spelling style.
+A pattern prefixed with `re:` is a case-insensitive regular expression matched against the
+key as written:
 
 ```python
 from safestream_enterprise import DEFAULT_FIELD_RULES, StructuredRedactor
 
-rules = {"*loyalty_number*": "id_number", **DEFAULT_FIELD_RULES}
+rules = {
+    "*loyalty_number*": "id_number",  # loyaltyNumber, LOYALTY-NUMBER, ...
+    "re:^x-.*-signature$": "secret",  # X-Amz-Signature, x-goog-signature
+    **DEFAULT_FIELD_RULES,
+}
 redactor = StructuredRedactor(field_rules=rules)
 ```
 
 ## Security model
 
-- **Fail closed.** A non-JSON record is redacted as text. A processing failure sends the record
-  to the restricted DLQ. A delivery failure stops the consumer without committing offsets. In
-  none of these cases does an unredacted record reach the clean topic.
+- **Fail closed.** A record that is not JSON, or that fails processing, goes to the restricted
+  DLQ while the consumer keeps running. If the brokers fail to acknowledge a batch, the
+  consumer exits without committing offsets, and Kubernetes restarts it from the last safe
+  point. In none of these cases does an unredacted record reach the clean topic.
 - **Keys and headers too.** Kafka message keys and header values are redacted, because
   user-ID partition keys and forwarded auth headers leak data as well.
 - **No content in logs.** Operational logs carry topic, partition, offset and counts, never
   payloads. The DLQ records only the exception class, never its message.
-- **Hardened runtime.** The container runs as non-root on a read-only root filesystem with all
-  Linux capabilities dropped, and a NetworkPolicy allows egress to the Kafka brokers and DNS
-  only.
+- **Hardened runtime.** The image is distroless: no shell, no package manager. The container
+  runs as non-root on a read-only root filesystem with all Linux capabilities dropped. A
+  default-deny NetworkPolicy allows egress only to the Kafka brokers (port 9092) and DNS.
 - **No plugin code by default.** Third-party detector plugins are disabled in the service.
 
 ## Repository layout
@@ -179,10 +193,10 @@ redactor = StructuredRedactor(field_rules=rules)
 ```
 SafeStream-Enterprise/
 ├── pyproject.toml                      # depends on safestream-redactor (OSS core)
-├── Dockerfile                          # connector image (non-root)
+├── Dockerfile                          # distroless, non-root connector image
 ├── deploy/
 │   └── kubernetes/
-│       └── kafka-redactor.yaml         # Deployment + egress NetworkPolicy
+│       └── kafka-redactor.yaml         # Deployment + default-deny NetworkPolicy
 ├── src/safestream_enterprise/
 │   ├── parsers/
 │   │   └── json_ast.py                 # structure-aware JSON/NDJSON redaction

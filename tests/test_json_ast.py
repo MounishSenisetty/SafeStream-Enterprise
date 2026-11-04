@@ -1,8 +1,9 @@
 import json
 
+import pytest
 from safestream_redactor import RedactionMode, RedactionPolicy, RedactionStats, Redactor
 
-from safestream_enterprise import StructuredRedactor
+from safestream_enterprise import StructuredParseError, StructuredRedactor
 
 R = StructuredRedactor()
 
@@ -54,10 +55,32 @@ def test_free_text_values_still_scanned_including_ints() -> None:
 
 def test_deep_nesting_and_root_array() -> None:
     deep: object = {"password": "p"}
-    for _ in range(2000):
+    for _ in range(250):
         deep = [deep]
-    assert '"p"' not in R.redact_line(json.dumps(deep)).text
+    out = R.redact_line(json.dumps(deep))
+    assert out.structured and '"p"' not in out.text
     assert redact([{"email": "x"}, "ok"]) == [{"email": "[REDACTED]"}, "ok"]
+
+
+def test_too_deep_or_invalid_json_falls_back_or_raises_in_strict_mode() -> None:
+    too_deep = "[" * 1000 + '{"password": "hunter2"}' + "]" * 1000  # parses, can't serialise
+    hostile = "[" * 2000 + "]" * 2000  # doesn't parse
+    stats = RedactionStats()
+    assert not R.redact_line(too_deep, stats).structured
+    assert not R.redact_line(hostile).structured
+    assert "secret" not in stats.counts  # the failed structured walk wasn't counted
+    for bad in (too_deep, hostile, b"\xff not json", '{"password": "hunter2"'):
+        with pytest.raises(StructuredParseError) as info:
+            R.redact_line(bad, strict=True)
+        assert "hunter2" not in str(info.value)  # error never quotes the record
+
+
+def test_regex_rules_match_raw_key() -> None:
+    r = StructuredRedactor(field_rules={"re:^x-.*-sig$": "secret"})
+    out = json.loads(r.redact_line('{"X-Amz-Sig": "abc", "x-amz-date": "d"}').text)
+    assert out == {"X-Amz-Sig": "[REDACTED]", "x-amz-date": "d"}
+    with pytest.raises(ValueError, match="invalid field rule"):
+        StructuredRedactor(field_rules={"re:(": "secret"})
 
 
 def test_non_json_falls_back_to_text_engine() -> None:
