@@ -23,13 +23,14 @@ Two passes over every value, both fail-closed
    scanned by the core engine, so ``{"msg": "login by bob@corp.example"}`` is
    caught exactly as the OSS CLI would catch it.
 
-A line that is not valid JSON is never passed through: it falls back to the
-OSS text path (``Redactor.redact``), so mixed-format streams are always covered.
+A line that is not valid JSON is never passed through: by default it falls back
+to the OSS free-text path, so mixed-format streams are always covered; with
+``strict=True`` it raises :class:`StructuredParseError` so the caller can route
+it elsewhere (the Kafka connector sends it to its DLQ).
 
 Replacement text comes from the engine's own :class:`RedactionPolicy`, so
-``replace`` / ``mask`` / ``pseudonymize`` / ``hash`` / ``encrypt`` behave
-identically for structural and textual hits, and pseudonyms stay joinable
-across both paths.
+``replace`` / ``mask`` / ``pseudonymize`` behave identically for structural and
+textual hits, and pseudonyms stay joinable across both paths.
 
 Parsing and serialisation use ``orjson`` (Rust): several times faster than the
 stdlib ``json`` module, it emits compact UTF-8 ``bytes`` directly (what Kafka
@@ -66,13 +67,14 @@ REGEX_PREFIX = "re:"
 _KEY_STRIP = re.compile(r"[^0-9a-z]+")
 _RULE_STRIP = re.compile(r"[^0-9a-z*?]+")
 
-#: Default field rules, evaluated in order, first match wins. Entity types are
-#: limited to those in the published ``safestream-redactor`` 0.4.x API; usernames,
-#: IBANs and street addresses move to their dedicated types once the OSS release
-#: carrying ``USERNAME``/``IBAN``/``ADDRESS`` ships. Patterns are
-#: globs over the *normalised* key (see above). They are deliberately specific:
-#: a bare ``*name*`` would also redact ``hostname``/``filename``/``service_name``
-#: and destroy the operational value of every log line.
+#: Default field rules, evaluated in order, first match wins. Patterns are globs
+#: over the *normalised* key (see above). They are deliberately specific: a bare
+#: ``*name*`` would also redact ``hostname``/``filename``/``service_name`` and
+#: destroy the operational value of every log line.
+#:
+#: Entity types are limited to the published ``safestream-redactor`` 0.4.x API:
+#: usernames, IBANs and street addresses move to dedicated types once the OSS
+#: release carrying ``USERNAME``/``IBAN``/``ADDRESS`` ships.
 DEFAULT_FIELD_RULES: Mapping[str, EntityType] = {
     # --- credentials (PCI-DSS 8, SOC 2 CC6) ---------------------------------
     "*password*": EntityType.SECRET,
