@@ -226,3 +226,11 @@ pip install -e ".[dev]"
 ```bash
 pytest && ruff check . && mypy
 ```
+
+Integration tests run against a real broker and, optionally, the built image. They are
+skipped unless the environment names a broker. CI runs them against an `apache/kafka`
+service container:
+
+```bash
+SAFESTREAM_IT_BOOTSTRAP=localhost:9092 SAFESTREAM_IT_IMAGE=safestream-enterprise:ci pytest tests/test_kafka_integration.py
+```
