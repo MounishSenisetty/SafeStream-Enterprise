@@ -6,9 +6,10 @@
 # pip, so a compromised process has almost nothing to work with.
 # Both stages are Debian 12 + CPython 3.11, so the compiled wheels
 # (confluent-kafka/librdkafka, orjson, pydantic-core) are ABI-compatible.
-# For production, pin both images by digest (@sha256:...) instead of tag.
+# Both base images are pinned by multi-arch index digest (amd64 + arm64), so a
+# rebuild of the same commit gets the same bases; Dependabot proposes updates.
 
-FROM python:3.11-slim-bookworm AS build
+FROM python:3.11-slim-bookworm@sha256:94a8fee35252d06ab75856f15f12c7bae67b10e8a6da93c7fded82b2610926cd AS build
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /src
 COPY pyproject.toml README.md ./
@@ -17,7 +18,7 @@ COPY src ./src
 # manylinux wheels resolved here and no compiler toolchain is ever needed.
 RUN pip install --only-binary=:all: --target /install .
 
-FROM gcr.io/distroless/python3-debian12:nonroot
+FROM gcr.io/distroless/python3-debian12:nonroot@sha256:7d1042ce588ab97019fe95c24ffca7bc5a82ccdac572511d5e09bda4435c89c5
 COPY --from=build /install /app/site-packages
 ENV PYTHONPATH=/app/site-packages \
     PYTHONDONTWRITEBYTECODE=1 \

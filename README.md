@@ -250,3 +250,16 @@ service container:
 ```bash
 SAFESTREAM_IT_BOOTSTRAP=localhost:9092 SAFESTREAM_IT_IMAGE=safestream-enterprise:ci pytest tests/test_kafka_integration.py
 ```
+
+### Releasing
+
+Bump `__version__` in `src/safestream_enterprise/__init__.py`, merge, then publish a GitHub
+Release tagged `v<version>`. The release workflow:
+
+1. runs the full CI suite on the release commit, including the real-Kafka and container tests;
+2. refuses a tag that doesn't match the package version;
+3. smoke-tests the image, then pushes `ghcr.io/mounishsenisetty/safestream-enterprise:<version>`
+   (and `:<major>.<minor>`) for linux/amd64 and linux/arm64, with an SBOM and build provenance.
+
+Base images are pinned by digest, and Dependabot proposes digest, dependency and action updates
+weekly.
