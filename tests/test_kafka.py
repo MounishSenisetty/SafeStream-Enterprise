@@ -12,6 +12,7 @@ from pydantic import ValidationError
 
 from safestream_enterprise import StructuredRedactor
 from safestream_enterprise.connectors.kafka import (
+    MAX_TRANSACTION_ATTEMPTS,
     ConnectorConfig,
     DeliveryError,
     KafkaRedactionConnector,
@@ -26,8 +27,11 @@ class FakeMsg:
         key: bytes | None = None,
         err: Any = None,
         headers: list[tuple[str, bytes]] | None = None,
+        partition: int = 0,
+        offset: int = 7,
     ) -> None:
         self._v, self._k, self._e, self._h = value, key, err, headers
+        self._p, self._o = partition, offset
 
     def value(self) -> bytes | None:
         return self._v
@@ -48,10 +52,10 @@ class FakeMsg:
         return "ingress-logs"
 
     def partition(self) -> int:
-        return 0
+        return self._p
 
     def offset(self) -> int:
-        return 7
+        return self._o
 
 
 class FakeProducer:
@@ -247,3 +251,131 @@ def test_main_never_logs_secret_config_values(
     )
     assert main() == 2
     assert "batch_size" in caplog.text and "s3cr3t-value" not in caplog.text
+
+
+# --- exactly_once ----------------------------------------------------------
+
+
+class TxnProducer(FakeProducer):
+    """Transactional fake: records only what a read_committed reader would see."""
+
+    def __init__(self, commit_errors: list[KafkaError] | None = None) -> None:
+        super().__init__()
+        self.commit_errors = list(commit_errors or [])
+        self.calls: list[str] = []
+        self.visible: list[dict[str, Any]] = []  # records in committed transactions
+        self.committed_offsets: list[list[tuple[str, int, int]]] = []
+        self._txn: list[dict[str, Any]] = []
+        self._txn_offsets: list[tuple[str, int, int]] = []
+
+    def begin_transaction(self) -> None:
+        self.calls.append("begin")
+        self._txn, self._txn_offsets = [], []
+
+    def produce(self, topic: str, **kw: Any) -> None:
+        super().produce(topic, **kw)
+        self._txn.append(self.sent[-1])
+
+    def send_offsets_to_transaction(self, offsets: Any, metadata: Any, timeout: float) -> None:
+        assert metadata == "group-metadata"
+        self.calls.append("send_offsets")
+        self._txn_offsets = [(tp.topic, tp.partition, tp.offset) for tp in offsets]
+
+    def commit_transaction(self, timeout: float) -> None:
+        self.calls.append("commit")
+        if self.commit_errors:
+            raise KafkaException(self.commit_errors.pop(0))
+        self.visible += self._txn
+        self.committed_offsets.append(self._txn_offsets)
+
+    def abort_transaction(self, timeout: float) -> None:
+        self.calls.append("abort")
+        self._txn = []
+
+
+class TxnConsumer(FakeConsumer):
+    def consumer_group_metadata(self) -> str:
+        return "group-metadata"
+
+    def commit(self, asynchronous: bool) -> None:
+        raise AssertionError("exactly_once must commit offsets inside the transaction")
+
+
+def make_eos(producer: TxnProducer) -> KafkaRedactionConnector:
+    return KafkaRedactionConnector(
+        ConnectorConfig(bootstrap_servers="x", delivery="exactly_once"),
+        StructuredRedactor(),
+        TxnConsumer(),  # type: ignore[arg-type]
+        producer,  # type: ignore[arg-type]
+    )
+
+
+BATCH = [
+    FakeMsg(b'{"email": "a@b.example"}', partition=0, offset=10),
+    FakeMsg(b"not structured", partition=0, offset=11),  # -> DLQ, same transaction
+    FakeMsg(b'{"ok": 1}', partition=1, offset=4),
+]
+
+
+def test_eos_commits_records_dlq_and_offsets_atomically() -> None:
+    p = TxnProducer()
+    conn = make_eos(p)
+    conn.process_batch(BATCH)  # type: ignore[arg-type]
+    assert p.calls == ["begin", "send_offsets", "commit"]
+    assert [m["topic"] for m in p.visible] == [
+        "egress-logs-clean",
+        "ingress-logs-dlq",
+        "egress-logs-clean",
+    ]
+    # last offset + 1 per partition, committed inside the transaction
+    assert sorted(p.committed_offsets[0]) == [("ingress-logs", 0, 12), ("ingress-logs", 1, 5)]
+    assert conn.stats.counts["email"] == 1 and conn.dead_lettered == 1
+
+
+def test_eos_abortable_error_retries_batch_without_duplicates_or_double_counting() -> None:
+    abortable = KafkaError(KafkaError._TIMED_OUT, "boom", txn_requires_abort=True)
+    p = TxnProducer(commit_errors=[abortable])
+    conn = make_eos(p)
+    conn.process_batch(BATCH)  # type: ignore[arg-type]
+    attempt = ["begin", "send_offsets", "commit"]
+    assert p.calls == [*attempt, "abort", *attempt]
+    assert len(p.visible) == 3  # the aborted attempt is invisible
+    assert conn.stats.counts["email"] == 1 and conn.dead_lettered == 1
+
+
+def test_eos_retriable_commit_is_retried_in_place() -> None:
+    retriable = KafkaError(KafkaError._TIMED_OUT, "slow", retriable=True)
+    p = TxnProducer(commit_errors=[retriable])
+    make_eos(p).process_batch(BATCH)  # type: ignore[arg-type]
+    assert p.calls == ["begin", "send_offsets", "commit", "commit"]
+    assert len(p.visible) == 3
+
+
+def test_eos_gives_up_after_repeated_aborts() -> None:
+    abortable = KafkaError(KafkaError._TIMED_OUT, "boom", txn_requires_abort=True)
+    p = TxnProducer(commit_errors=[abortable] * MAX_TRANSACTION_ATTEMPTS)
+    with pytest.raises(DeliveryError):
+        make_eos(p).process_batch(BATCH)  # type: ignore[arg-type]
+    assert p.visible == [] and p.committed_offsets == []
+
+
+def test_eos_fatal_error_is_raised_not_retried() -> None:
+    fenced = KafkaError(KafkaError._FENCED, "fenced", fatal=True)
+    p = TxnProducer(commit_errors=[fenced])
+    with pytest.raises(KafkaException):
+        make_eos(p).process_batch(BATCH)  # type: ignore[arg-type]
+    assert p.calls == ["begin", "send_offsets", "commit"]
+
+
+def test_eos_config() -> None:
+    cfg = ConnectorConfig.from_env(
+        {"KAFKA_BOOTSTRAP_SERVERS": "b:9092", "SAFESTREAM_DELIVERY": "exactly_once"}
+    )
+    assert cfg.producer_config()["transactional.id"].startswith("safestream-redactor-")  # type: ignore[union-attr]
+    assert "transactional.id" not in ConnectorConfig(bootstrap_servers="b").producer_config()
+    pinned = ConnectorConfig(
+        bootstrap_servers="b", delivery="exactly_once", transactional_id="redactor-0"
+    )
+    assert pinned.producer_config()["transactional.id"] == "redactor-0"
+    with pytest.raises(ValidationError):  # an id without the mode is a misconfiguration
+        ConnectorConfig(bootstrap_servers="b", transactional_id="redactor-0")

@@ -60,6 +60,9 @@ def drain(topic: str, expected: int, timeout_s: float = 60.0) -> list[Message]:
             "group.id": f"it-reader-{uuid.uuid4().hex}",
             "auto.offset.reset": "earliest",
             "enable.auto.commit": False,
+            # What a downstream consumer must use for the exactly_once guarantee;
+            # also correct for at_least_once (no transactions -> nothing hidden).
+            "isolation.level": "read_committed",
         }
     )
     c.subscribe([topic])
@@ -118,7 +121,8 @@ class Running:
         assert not self.errors, self.errors
 
 
-def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str]) -> None:
+@pytest.mark.parametrize("delivery", ["at_least_once", "exactly_once"])
+def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str], delivery: str) -> None:
     group = f"it-connector-{uuid.uuid4().hex[:8]}"
     config = ConnectorConfig(
         bootstrap_servers=BOOTSTRAP,
@@ -127,6 +131,7 @@ def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str]) -> N
         egress_topic=topics["egress"],
         dlq_topic=topics["dlq"],
         poll_timeout_s=0.5,
+        delivery=delivery,  # type: ignore[arg-type]
     )
     produce(
         topics["ingress"],
@@ -191,6 +196,8 @@ def test_container_image_under_kubernetes_restrictions(topics: dict[str, str]) -
         "DLQ_TOPIC": topics["dlq"],
         "SAFESTREAM_MODE": "pseudonymize",
         "SAFESTREAM_HMAC_KEY": "ci-only-key-" + "x" * 32,
+        # transactional.id derived from the container hostname, as on Kubernetes
+        "SAFESTREAM_DELIVERY": "exactly_once",
     }
     run = ["docker", "run", "-d", "--name", name, "--network", "host", "--read-only"]
     run += ["--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65532:65532"]

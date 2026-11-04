@@ -65,10 +65,14 @@ XML, anything else as JSON. Records that are neither are never passed through un
 By default the Kafka connector sends them to the dead-letter topic. You can choose to have them text-redacted
 and delivered to the clean topic instead.
 
-**Delivery guarantees.** No record reaches the clean topic unredacted. Offsets are committed
-only after the clean topic acknowledges the data, so a crash replays records and never drops
-them. A record that cannot be processed goes to an access-restricted dead-letter topic and
-never to the clean one.
+**Delivery guarantees.** No record reaches the clean topic unredacted, and a record that cannot
+be processed goes to an access-restricted dead-letter topic, never to the clean one. Two modes:
+
+- **At-least-once** (default). Offsets are committed only after the clean topic acknowledges the
+  data, so a crash replays records and never drops them. Duplicates are possible after a crash.
+- **Exactly-once.** Each batch of clean records, dead-letter records and consumer offsets
+  commits as one Kafka transaction, so a crash can neither drop nor duplicate a record.
+  Downstream consumers must read the clean topic with `isolation.level=read_committed`.
 
 ## Why SafeStream Enterprise vs. legacy DLP
 
@@ -156,7 +160,9 @@ with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
 | `SAFESTREAM_MODE` | `replace` | `replace`, `mask` or `pseudonymize` |
 | `SAFESTREAM_HMAC_KEY` | none | Key for consistent pseudonyms (mount from a Secret) |
 | `SAFESTREAM_UNPARSEABLE` | `dlq` | Payloads that are neither JSON nor XML. `dlq`: send them to the DLQ. `redact_text`: text-redact them and deliver them to egress |
-| `SAFESTREAM_BATCH_SIZE` | `500` | Records per commit |
+| `SAFESTREAM_DELIVERY` | `at_least_once` | `at_least_once` or `exactly_once` (one transaction per batch; needs transactional-ID write permission on the brokers) |
+| `SAFESTREAM_TRANSACTIONAL_ID` | `<group id>-<hostname>` | Exactly-once only. The default (the pod name on Kubernetes) is unique per instance, which is all exactly-once needs |
+| `SAFESTREAM_BATCH_SIZE` | `500` | Records per commit (per transaction in exactly-once mode) |
 | `SAFESTREAM_FLUSH_TIMEOUT_S` | `30` | Maximum wait for egress acknowledgements per batch |
 | `SAFESTREAM_KAFKA_*` | none | Any Kafka client setting, e.g. `SAFESTREAM_KAFKA_SECURITY_PROTOCOL=SASL_SSL` |
 

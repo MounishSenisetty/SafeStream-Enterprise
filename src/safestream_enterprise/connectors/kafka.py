@@ -6,8 +6,10 @@ Data flow::
                                       │ (not JSON/XML / redaction raised / egress rejected)
                                       └────────produce──────▶ ingress-logs-dlq
 
-Delivery semantics: **at-least-once, never unredacted to egress.**
+Delivery semantics: **never unredacted to egress**, in one of two modes
+(``SAFESTREAM_DELIVERY``):
 
+``at_least_once`` (default)
 * Auto-commit is off. Offsets are committed synchronously only after every
   message in a batch has been *acknowledged* by the egress brokers
   (``acks=all`` + idempotent producer). A crash between produce and commit
@@ -17,6 +19,22 @@ Delivery semantics: **at-least-once, never unredacted to egress.**
   resumes from the last committed offset. (Continuing in-process would move the
   in-memory position past the failed messages and a later commit would skip
   them for good.)
+
+``exactly_once``
+* Each batch is one Kafka transaction: its egress records, its DLQ records and
+  the consumer offsets commit atomically (``send_offsets_to_transaction``), so
+  a crash at any point either publishes the whole batch with its offsets or
+  none of it. Consumers of the egress topic must read with
+  ``isolation.level=read_committed`` to get the guarantee.
+* An abortable transaction error aborts and retries the same batch in-process
+  (up to :data:`MAX_TRANSACTION_ATTEMPTS`); nothing was visible to
+  read_committed consumers, so the retry cannot duplicate. If every attempt
+  fails, :class:`DeliveryError` exits the process without committing, as above.
+* Zombie instances are fenced by the consumer-group generation (KIP-447), so
+  the ``transactional.id`` only has to be unique among live instances; it
+  defaults to ``<group id>-<hostname>`` (the pod name on Kubernetes).
+
+Both modes:
 * A message that cannot be processed (neither JSON nor XML, redaction raised, or the
   producer refused the redacted record) is never forwarded to egress and never
   stops the loop. It is routed, raw, to the dead-letter topic with the
@@ -38,9 +56,11 @@ partition, offset and counts.
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import signal
+import socket
 import sys
 from collections.abc import Mapping
 from types import FrameType
@@ -53,6 +73,7 @@ from confluent_kafka import (
     KafkaException,
     Message,
     Producer,
+    TopicPartition,
 )
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from safestream_redactor import RedactionMode, RedactionPolicy, RedactionStats, Redactor
@@ -67,6 +88,8 @@ KAFKA_ENV_PREFIX = "SAFESTREAM_KAFKA_"
 MODE_HEADER = "x-safestream-redaction"
 #: DLQ header carrying the exception *class* (never its message: it may quote data).
 ERROR_HEADER = "x-safestream-error"
+#: exactly_once: transaction attempts per batch before giving up (and restarting).
+MAX_TRANSACTION_ATTEMPTS = 5
 
 
 class DeliveryError(RuntimeError):
@@ -101,6 +124,11 @@ class ConnectorConfig(BaseModel):
     #: ``dlq``: it goes to the DLQ untouched. ``redact_text``: it is redacted as
     #: free text and sent to egress instead.
     unparseable: Literal["dlq", "redact_text"] = "dlq"
+    #: ``at_least_once``: commit offsets after egress acks (duplicates possible
+    #: after a crash). ``exactly_once``: one Kafka transaction per batch.
+    delivery: Literal["at_least_once", "exactly_once"] = "at_least_once"
+    #: exactly_once only. Defaults to ``<group_id>-<hostname>``.
+    transactional_id: str | None = Field(default=None, min_length=1)
     #: Extra librdkafka properties applied to both consumer and producer
     #: (security.protocol, sasl.*, ssl.* ...). Secret-wrapped: may hold passwords.
     client_overrides: dict[str, SecretStr] = Field(default_factory=dict)
@@ -115,7 +143,15 @@ class ConnectorConfig(BaseModel):
             raise ValueError("ingress, egress and DLQ topics must all be different")
         if self.redaction_mode is RedactionMode.PSEUDONYMIZE and not self.hmac_key:
             raise ValueError("pseudonymize mode requires SAFESTREAM_HMAC_KEY")
+        if self.transactional_id and self.delivery != "exactly_once":
+            raise ValueError(
+                "SAFESTREAM_TRANSACTIONAL_ID requires SAFESTREAM_DELIVERY=exactly_once"
+            )
         return self
+
+    @property
+    def exactly_once(self) -> bool:
+        return self.delivery == "exactly_once"
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> ConnectorConfig:
@@ -136,6 +172,8 @@ class ConnectorConfig(BaseModel):
             "SAFESTREAM_MODE": "redaction_mode",
             "SAFESTREAM_HMAC_KEY": "hmac_key",
             "SAFESTREAM_UNPARSEABLE": "unparseable",
+            "SAFESTREAM_DELIVERY": "delivery",
+            "SAFESTREAM_TRANSACTIONAL_ID": "transactional_id",
         }
         data: dict[str, object] = {field: env[var] for var, field in names.items() if env.get(var)}
         data["client_overrides"] = {
@@ -164,7 +202,7 @@ class ConnectorConfig(BaseModel):
         }
 
     def producer_config(self) -> dict[str, str | int | bool]:
-        return {
+        config: dict[str, str | int | bool] = {
             "bootstrap.servers": self.bootstrap_servers,
             # Idempotence implies acks=all, unbounded retries, ordered delivery
             # per partition: no duplicates or reordering from producer retries.
@@ -172,8 +210,12 @@ class ConnectorConfig(BaseModel):
             "acks": "all",
             "compression.type": "zstd",
             "linger.ms": 20,
-            **self._overrides(),
         }
+        if self.exactly_once:
+            config["transactional.id"] = (
+                self.transactional_id or f"{self.group_id}-{socket.gethostname()}"
+            )
+        return {**config, **self._overrides()}
 
 
 class KafkaRedactionConnector:
@@ -210,12 +252,17 @@ class KafkaRedactionConnector:
 
     def run(self) -> None:
         """Main loop. Returns after :meth:`stop`; raises on unrecoverable errors."""
+        if self.config.exactly_once:
+            # Registers the transactional.id and aborts any transaction a
+            # previous instance with the same id left open.
+            self.producer.init_transactions(self.config.flush_timeout_s)
         self.consumer.subscribe([self.config.ingress_topic])
         logger.info(
-            "consuming %s -> %s (group=%s)",
+            "consuming %s -> %s (group=%s, delivery=%s)",
             self.config.ingress_topic,
             self.config.egress_topic,
             self.config.group_id,
+            self.config.delivery,
         )
         try:
             while self._running:
@@ -336,20 +383,31 @@ class KafkaRedactionConnector:
 
     def process_batch(self, batch: list[Message]) -> None:
         """Redact and publish a batch, then commit its offsets (all or nothing)."""
-        handled = 0
+        messages: list[Message] = []
         for msg in batch:
             err = msg.error()
-            if err is not None:
-                if err.fatal():
-                    raise KafkaException(err)
+            if err is None:
+                messages.append(msg)
+            elif err.fatal():
+                raise KafkaException(err)
+            else:
                 # Transient broker/partition errors: librdkafka retries itself.
                 logger.warning("consumer error: %s", err)
-                continue
+        if not messages:
+            return  # only error events: no new offsets to commit
+        if self.config.exactly_once:
+            self._process_transactional(messages)
+        else:
+            self._process_at_least_once(messages)
+
+    def _publish(self, messages: list[Message]) -> None:
+        for msg in messages:
             self.handle_message(msg)
-            handled += 1
             # Serve delivery callbacks so the local queue keeps draining.
             self.producer.poll(0)
 
+    def _process_at_least_once(self, messages: list[Message]) -> None:
+        self._publish(messages)
         remaining = self.producer.flush(self.config.flush_timeout_s)
         if remaining or self._delivery_errors:
             errors = [str(e) for e in self._delivery_errors[:5]]
@@ -358,12 +416,70 @@ class KafkaRedactionConnector:
                 f"{remaining} record(s) unflushed, delivery errors: {errors}; "
                 "offsets NOT committed, batch will be replayed after restart"
             )
-        if not handled:
-            return  # only error events: no new offsets (commit would raise _NO_OFFSET)
         # Synchronous: when this returns, a restart resumes after this batch.
-        # ponytail: at-least-once. Upgrade to exactly-once with a transactional
-        # producer + send_offsets_to_transaction() if duplicates downstream matter.
         self.consumer.commit(asynchronous=False)
+
+    def _process_transactional(self, messages: list[Message]) -> None:
+        """Publish ``messages`` and commit their offsets in one transaction.
+
+        Abortable failures abort and retry the same in-memory batch: the
+        consumer position is never rewound because offsets are committed
+        explicitly from ``messages``, not from the consumer's position.
+        """
+        offsets = _next_offsets(messages)
+        for attempt in range(1, MAX_TRANSACTION_ATTEMPTS + 1):
+            # Counters are restored on abort so a retried batch isn't counted twice.
+            saved = (copy.deepcopy(self.stats), self.dead_lettered)
+            self.producer.begin_transaction()
+            try:
+                self._publish(messages)
+                self.producer.send_offsets_to_transaction(
+                    offsets, self.consumer.consumer_group_metadata(), self.config.flush_timeout_s
+                )
+                self._commit_transaction()
+            except KafkaException as exc:
+                error: KafkaError = exc.args[0]
+                if not error.txn_requires_abort():
+                    raise  # fatal (e.g. fenced by a newer instance): exit for restart
+                logger.warning(
+                    "transaction aborted (attempt %d/%d): %s",
+                    attempt,
+                    MAX_TRANSACTION_ATTEMPTS,
+                    error.name(),
+                )
+                self.producer.abort_transaction(self.config.flush_timeout_s)
+                self._delivery_errors.clear()
+                self.stats, self.dead_lettered = saved
+                continue
+            self._delivery_errors.clear()
+            return
+        raise DeliveryError(
+            f"transaction aborted {MAX_TRANSACTION_ATTEMPTS} times; offsets NOT committed, "
+            "batch will be replayed after restart"
+        )
+
+    def _commit_transaction(self) -> None:
+        """Commit, retrying errors librdkafka marks retriable (e.g. a timeout)."""
+        for attempt in range(1, MAX_TRANSACTION_ATTEMPTS + 1):
+            try:
+                self.producer.commit_transaction(self.config.flush_timeout_s)
+                return
+            except KafkaException as exc:
+                if not exc.args[0].retriable() or attempt == MAX_TRANSACTION_ATTEMPTS:
+                    raise
+
+
+def _next_offsets(messages: list[Message]) -> list[TopicPartition]:
+    """The offsets to commit for ``messages``: last offset + 1 per partition."""
+    last: dict[tuple[str, int], int] = {}
+    for msg in messages:
+        topic, partition, offset = msg.topic(), msg.partition(), msg.offset()
+        # Always set on consumed (non-error) messages; the stubs type them Optional.
+        if topic is None or partition is None or offset is None:
+            raise KafkaException(KafkaError(KafkaError._BAD_MSG, "message without position"))
+        key = (topic, partition)
+        last[key] = max(last.get(key, -1), offset)
+    return [TopicPartition(topic, part, off + 1) for (topic, part), off in last.items()]
 
 
 def build_redactor(config: ConnectorConfig) -> StructuredRedactor:
