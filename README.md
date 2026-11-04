@@ -253,8 +253,9 @@ SAFESTREAM_IT_BOOTSTRAP=localhost:9092 SAFESTREAM_IT_IMAGE=safestream-enterprise
 
 ### Releasing
 
-Bump `__version__` in `src/safestream_enterprise/__init__.py`, merge, then publish a GitHub
-Release tagged `v<version>`. The release workflow:
+Bump `__version__` in `src/safestream_enterprise/__init__.py`, merge, then push a tag
+`v<version>`, or create a GitHub Release with that new tag, which pushes it. The release
+workflow:
 
 1. runs the full CI suite on the release commit, including the real-Kafka and container tests;
 2. refuses a tag that doesn't match the package version;
