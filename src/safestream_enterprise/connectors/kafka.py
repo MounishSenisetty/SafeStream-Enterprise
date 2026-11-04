@@ -3,7 +3,7 @@
 Data flow::
 
     ingress-logs ──consume──▶ StructuredRedactor ──produce──▶ egress-logs-clean
-                                      │ (not JSON / redaction raised / egress rejected)
+                                      │ (not JSON/XML / redaction raised / egress rejected)
                                       └────────produce──────▶ ingress-logs-dlq
 
 Delivery semantics: **at-least-once, never unredacted to egress.**
@@ -17,7 +17,7 @@ Delivery semantics: **at-least-once, never unredacted to egress.**
   resumes from the last committed offset. (Continuing in-process would move the
   in-memory position past the failed messages and a later commit would skip
   them for good.)
-* A message that cannot be processed (not valid JSON, redaction raised, or the
+* A message that cannot be processed (neither JSON nor XML, redaction raised, or the
   producer refused the redacted record) is never forwarded to egress and never
   stops the loop. It is routed, raw, to the dead-letter topic with the
   exception class in the ``x-safestream-error`` header; its offset is committed
@@ -97,9 +97,10 @@ class ConnectorConfig(BaseModel):
     redaction_mode: RedactionMode = RedactionMode.REPLACE
     #: Key for ``pseudonymize`` (consistent tokens across topics and days).
     hmac_key: SecretStr | None = None
-    #: ``dlq``: a payload that is not valid JSON goes to the DLQ untouched.
-    #: ``redact_text``: it is redacted as free text and sent to egress instead.
-    non_json: Literal["dlq", "redact_text"] = "dlq"
+    #: What happens to a payload that is neither valid JSON nor valid XML.
+    #: ``dlq``: it goes to the DLQ untouched. ``redact_text``: it is redacted as
+    #: free text and sent to egress instead.
+    unparseable: Literal["dlq", "redact_text"] = "dlq"
     #: Extra librdkafka properties applied to both consumer and producer
     #: (security.protocol, sasl.*, ssl.* ...). Secret-wrapped: may hold passwords.
     client_overrides: dict[str, SecretStr] = Field(default_factory=dict)
@@ -134,7 +135,7 @@ class ConnectorConfig(BaseModel):
             "SAFESTREAM_FLUSH_TIMEOUT_S": "flush_timeout_s",
             "SAFESTREAM_MODE": "redaction_mode",
             "SAFESTREAM_HMAC_KEY": "hmac_key",
-            "SAFESTREAM_NON_JSON": "non_json",
+            "SAFESTREAM_UNPARSEABLE": "unparseable",
         }
         data: dict[str, object] = {field: env[var] for var, field in names.items() if env.get(var)}
         data["client_overrides"] = {
@@ -284,9 +285,10 @@ class KafkaRedactionConnector:
                 out_value: bytes | None = None
                 mode = b"tombstone"
             else:
-                # strict: a non-JSON payload raises StructuredParseError -> DLQ.
+                # JSON and XML are both handled structurally. strict: anything
+                # else raises StructuredParseError -> DLQ.
                 record = self.redactor.redact_line(
-                    value, self.stats, strict=self.config.non_json == "dlq"
+                    value, self.stats, strict=self.config.unparseable == "dlq"
                 )
                 out_value = record.data
                 mode = b"structural" if record.structured else b"text"

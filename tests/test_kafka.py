@@ -144,7 +144,18 @@ def test_redaction_crash_goes_to_dlq_not_egress() -> None:
     assert c.commits == 1
 
 
-def test_non_json_payload_goes_to_dlq_and_loop_continues() -> None:
+def test_xml_payload_is_redacted_structurally() -> None:
+    p = FakeProducer()
+    conn, c = make(p)
+    conn.process_batch([FakeMsg(b"<log><email>a@b.example</email><lvl>info</lvl></log>")])  # type: ignore[list-item]
+    (sent,) = p.sent
+    assert sent["topic"] == "egress-logs-clean"
+    assert sent["value"] == b"<log><email>[REDACTED]</email><lvl>info</lvl></log>"
+    assert sent["headers"] == [("x-safestream-redaction", b"structural")]
+    assert c.commits == 1
+
+
+def test_unparseable_payload_goes_to_dlq_and_loop_continues() -> None:
     p = FakeProducer()
     conn, c = make(p)
     conn.process_batch([FakeMsg(b"plain text bob@corp.example"), FakeMsg(b'{"ok": 1}')])  # type: ignore[list-item]
@@ -155,11 +166,11 @@ def test_non_json_payload_goes_to_dlq_and_loop_continues() -> None:
     assert c.commits == 1
 
 
-def test_non_json_can_be_text_redacted_instead() -> None:
+def test_unparseable_can_be_text_redacted_instead() -> None:
     p = FakeProducer()
     consumer = FakeConsumer()
     conn = KafkaRedactionConnector(
-        ConnectorConfig(bootstrap_servers="x", non_json="redact_text"),
+        ConnectorConfig(bootstrap_servers="x", unparseable="redact_text"),
         StructuredRedactor(),
         consumer,
         p,  # type: ignore[arg-type]
@@ -215,7 +226,7 @@ def test_config_from_env() -> None:
         {"EGRESS_TOPIC": "ingress-logs"},  # infinite loop
         {"SAFESTREAM_MODE": "pseudonymize"},  # no HMAC key
         {"SAFESTREAM_BATCH_SIZE": "0"},
-        {"SAFESTREAM_NON_JSON": "drop"},
+        {"SAFESTREAM_UNPARSEABLE": "drop"},
     ],
 )
 def test_config_rejects_unsafe_values(env: dict[str, str]) -> None:

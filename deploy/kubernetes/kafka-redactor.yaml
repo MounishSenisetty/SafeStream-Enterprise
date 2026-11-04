@@ -57,8 +57,9 @@ spec:
               value: "egress-logs-clean"
             - name: DLQ_TOPIC
               value: "ingress-logs-dlq"
-            # dlq: non-JSON payloads go to the DLQ; redact_text: text-redact them to egress.
-            - name: SAFESTREAM_NON_JSON
+            # Payloads that are neither JSON nor XML. dlq: send them to the DLQ;
+            # redact_text: text-redact them and deliver them to egress.
+            - name: SAFESTREAM_UNPARSEABLE
               value: "dlq"
             - name: SAFESTREAM_MODE
               value: "pseudonymize"

@@ -10,7 +10,7 @@ GDPR erasure request.
 
 It is the commercial edition of [SafeStream-Redactor](https://github.com/MounishSenisetty/SafeStream-Redactor),
 the open-source streaming redaction engine. It adds structure-aware redaction for JSON
-records, native Kafka integration, and production deployment manifests.
+and XML records, native Kafka integration, and production deployment manifests.
 
 ---
 
@@ -30,7 +30,7 @@ it once, at ingestion.
 |---|---|
 | **Breach prevention at the source** | Passwords, tokens, API keys, card numbers, SSNs, emails, phone numbers and names are removed before data is persisted, so a compromised log store holds nothing worth stealing. |
 | **Out-of-the-box compliance coverage** | Built-in field rules cover the data classes named by PCI-DSS, the HIPAA Safe Harbor identifiers, and GDPR personal data. No regex writing is needed on day one. |
-| **Accurate on structured data** | Each JSON record is parsed and redacted by field name *and* by content. `"LastName": "Smith"` is caught even though "Smith" matches no pattern. |
+| **Accurate on structured data** | Each JSON or XML record is parsed and redacted by field name *and* by content. `"LastName": "Smith"` and `<Data Name="TargetUserName">bob</Data>` are caught even though neither value matches a pattern. |
 | **Flat memory at any volume** | A 100 GB log file or a topic carrying billions of events runs in the same fixed memory footprint. Volume spikes cannot cause out-of-memory crashes. |
 | **Native to your data estate** | It runs as a Kafka consumer group on Kubernetes, scales horizontally with partitions, and writes to a clean topic that your existing sinks (S3, Snowflake, Databricks, Elastic, Splunk) already read. |
 | **Your data never leaves your network** | It is fully self-hosted. There is no SaaS round-trip, no vendor cloud and no telemetry. The cluster's network policy limits the pod to your brokers. |
@@ -53,13 +53,16 @@ data is removed:
 1. **Structural rules.** A field whose name indicates sensitive data (`password`, `card_number`,
    `LastName`, `patient_mrn`, ...) has its whole value redacted, including nested objects and
    arrays. Field names are matched regardless of spelling style: `lastName`, `last_name` and
-   `LAST-NAME` are treated as the same field.
+   `LAST-NAME` are treated as the same field. In XML, element names, attribute names, and
+   `Name`/`key` attributes (as in Windows Event Log `<Data Name="...">` fields) all count as
+   field names.
 2. **Content detection.** Every other value is scanned by the open-source engine's detectors
    (validated patterns, checksums, entropy analysis and contextual scoring). This catches
    secrets hidden in free text, such as `"msg": "retrying with key AKIA..."`.
 
-Records that are not JSON are never passed through unchecked. By default the Kafka
-connector sends them to the dead-letter topic. You can choose to have them text-redacted
+The format is detected per record: a record whose first character is `<` is handled as
+XML, anything else as JSON. Records that are neither are never passed through unchecked.
+By default the Kafka connector sends them to the dead-letter topic. You can choose to have them text-redacted
 and delivered to the clean topic instead.
 
 **Delivery guarantees.** No record reaches the clean topic unredacted. Offsets are committed
@@ -77,7 +80,7 @@ infrastructure.
 |---|---|---|---|
 | **When data is protected** | After it is stored (scheduled scans) | Per API call, if every producer calls it | **Inline, before anything is stored** |
 | **Where your data goes** | Vendor appliance or agent | Sent to the vendor's cloud for inspection | **Never leaves your network** |
-| **Structured logs (JSON)** | Treated as flat text; field context lost | Partial, per-API schema work | **Field-aware: redacts by key and by content** |
+| **Structured logs (JSON, XML)** | Treated as flat text; field context lost | Partial, per-API schema work | **Field-aware: redacts by key and by content** |
 | **Memory at 100 GB+** | Grows with input; large files skipped or chunked by hand | Request-size limits | **Constant, independent of volume** |
 | **Secrets & credentials** | PII-focused; API keys rarely covered | Limited | **Cloud keys, tokens, JWTs, private keys, high-entropy secrets** |
 | **Kafka / streaming** | Not supported, or requires custom glue | Custom glue per pipeline | **Native consumer group** |
@@ -134,6 +137,9 @@ redactor = StructuredRedactor()
 redactor.redact_line('{"LastName": "Smith", "msg": "contact bob@corp.example"}').text
 # '{"LastName":"[REDACTED]","msg":"contact [REDACTED]"}'
 
+redactor.redact_line('<user><Phone>555 0100</Phone><param key="password" value="x"/></user>').text
+# '<user><Phone>[REDACTED]</Phone><param key="password" value="[REDACTED]"/></user>'
+
 with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
     for line in redactor.redact_lines(src):  # streams; memory stays flat
         dst.write(line + "\n")
@@ -149,7 +155,7 @@ with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
 | `DLQ_TOPIC` | `ingress-logs-dlq` | Unprocessable records (restrict its ACLs like the ingress topic) |
 | `SAFESTREAM_MODE` | `replace` | `replace`, `mask` or `pseudonymize` |
 | `SAFESTREAM_HMAC_KEY` | none | Key for consistent pseudonyms (mount from a Secret) |
-| `SAFESTREAM_NON_JSON` | `dlq` | `dlq`: non-JSON payloads go to the DLQ. `redact_text`: they are text-redacted and delivered to egress |
+| `SAFESTREAM_UNPARSEABLE` | `dlq` | Payloads that are neither JSON nor XML. `dlq`: send them to the DLQ. `redact_text`: text-redact them and deliver them to egress |
 | `SAFESTREAM_BATCH_SIZE` | `500` | Records per commit |
 | `SAFESTREAM_FLUSH_TIMEOUT_S` | `30` | Maximum wait for egress acknowledgements per batch |
 | `SAFESTREAM_KAFKA_*` | none | Any Kafka client setting, e.g. `SAFESTREAM_KAFKA_SECURITY_PROTOCOL=SASL_SSL` |
@@ -175,10 +181,13 @@ redactor = StructuredRedactor(field_rules=rules)
 
 ## Security model
 
-- **Fail closed.** A record that is not JSON, or that fails processing, goes to the restricted
+- **Fail closed.** A record that is neither JSON nor XML, or that fails processing, goes to the restricted
   DLQ while the consumer keeps running. If the brokers fail to acknowledge a batch, the
   consumer exits without committing offsets, and Kubernetes restarts it from the last safe
   point. In none of these cases does an unredacted record reach the clean topic.
+- **Hostile XML is refused.** Any XML document with a DTD is treated as malformed, which
+  blocks entity-expansion bombs and external-entity (XXE) file reads and requests, in every
+  encoding. Nesting depth is capped at 254 levels for both JSON and XML.
 - **Keys and headers too.** Kafka message keys and header values are redacted, because
   user-ID partition keys and forwarded auth headers leak data as well.
 - **No content in logs.** Operational logs carry topic, partition, offset and counts, never
@@ -199,7 +208,8 @@ SafeStream-Enterprise/
 │       └── kafka-redactor.yaml         # Deployment + default-deny NetworkPolicy
 ├── src/safestream_enterprise/
 │   ├── parsers/
-│   │   └── json_ast.py                 # structure-aware JSON/NDJSON redaction
+│   │   ├── json_ast.py                 # structure-aware JSON/NDJSON redaction (entry point)
+│   │   └── xml_ast.py                  # structure-aware XML redaction, same field rules
 │   └── connectors/
 │       └── kafka.py                    # ingress -> redact -> egress consumer group
 └── tests/
@@ -212,7 +222,7 @@ SafeStream-Enterprise/
 | Streaming text redaction, constant memory | ✓ | ✓ |
 | PII + credential detectors, redaction modes | ✓ | ✓ |
 | CLI, REST, CI/CD gate, pre-commit | ✓ | ✓ (via the OSS core) |
-| Structure-aware JSON redaction (field rules) | | ✓ |
+| Structure-aware JSON and XML redaction (field rules) | | ✓ |
 | Kafka consumer-group connector | | ✓ |
 | Kubernetes deployment & network lockdown | | ✓ |
 | Commercial support & SLAs | | ✓ |

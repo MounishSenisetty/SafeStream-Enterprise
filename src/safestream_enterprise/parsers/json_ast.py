@@ -1,4 +1,9 @@
-"""Structure-aware (AST) redaction for JSON / NDJSON log records.
+"""Structure-aware (AST) redaction for JSON / NDJSON and XML log records.
+
+:class:`StructuredRedactor` is the single entry point for structured records:
+:meth:`~StructuredRedactor.redact_line` sends a record whose first non-blank
+character is ``<`` to the XML module (:mod:`.xml_ast`), and everything else
+to the JSON path below. Both use the same field rules.
 
 Why this exists
 ---------------
@@ -23,7 +28,7 @@ Two passes over every value, both fail-closed
    scanned by the core engine, so ``{"msg": "login by bob@corp.example"}`` is
    caught exactly as the OSS CLI would catch it.
 
-A line that is not valid JSON is never passed through: by default it falls back
+A line that is neither valid JSON nor valid XML is never passed through: by default it falls back
 to the OSS free-text path, so mixed-format streams are always covered; with
 ``strict=True`` it raises :class:`StructuredParseError` so the caller can route
 it elsewhere (the Kafka connector sends it to its DLQ).
@@ -51,6 +56,8 @@ from typing import NamedTuple, TypeAlias
 
 import orjson
 from safestream_redactor import Detection, EntityType, RedactionStats, Redactor
+
+from safestream_enterprise.parsers.xml_ast import XMLRejected, looks_like_xml, redact_xml
 
 #: Any value ``orjson.loads`` can produce.
 JSONValue: TypeAlias = "dict[str, JSONValue] | list[JSONValue] | str | int | float | bool | None"
@@ -155,15 +162,19 @@ DEFAULT_FIELD_RULES: Mapping[str, EntityType] = {
 
 
 class StructuredParseError(ValueError):
-    """A record is not valid JSON and the caller asked for strict parsing."""
+    """A record is neither valid JSON nor valid XML, and the caller asked for strict parsing."""
+
+
+class _NotJSON(ValueError):
+    """Internal: the JSON path cannot process this record (the message says why)."""
 
 
 class RedactedRecord(NamedTuple):
     """One redacted record.
 
-    ``data`` is the redacted record as UTF-8 bytes (compact JSON when
-    ``structured``). ``structured`` is ``False`` when the input was not valid
-    JSON and the OSS free-text path redacted it instead; connectors surface this
+    ``data`` is the redacted record as UTF-8 bytes (compact JSON, or XML, when
+    ``structured``). ``structured`` is ``False`` when the input was neither
+    valid JSON nor valid XML and the OSS free-text path redacted it instead; connectors surface this
     as a header so consumers know whether the record's shape was preserved.
     """
 
@@ -249,13 +260,18 @@ class StructuredRedactor:
     # value rewriting
     # ------------------------------------------------------------------
 
-    def _redact_scalar(
+    def redact_scalar(
         self,
         value: JSONValue,
         forced: EntityType | None,
         stats: RedactionStats | None,
     ) -> JSONValue:
-        """Return the redacted replacement for one leaf value."""
+        """Return the redacted replacement for one leaf value.
+
+        ``forced`` is the entity type from a matching field rule (the whole
+        value is redacted) or ``None`` (the value is scanned by the OSS
+        detectors). Shared by the JSON and XML walks.
+        """
         # bool before int: bool is an int subclass, and true/false/null carry
         # no payload worth hiding — keeping them preserves the record's shape.
         if value is None or isinstance(value, bool):
@@ -294,7 +310,7 @@ class StructuredRedactor:
         ``stats`` receives per-entity-type counts only.
         """
         if not isinstance(root, (dict, list)):
-            return self._redact_scalar(root, None, stats)
+            return self.redact_scalar(root, None, stats)
 
         stack: list[tuple[dict[str, JSONValue] | list[JSONValue], EntityType | None]] = [
             (root, None)
@@ -309,13 +325,13 @@ class StructuredRedactor:
                     if isinstance(child, (dict, list)):
                         stack.append((child, forced))
                     else:
-                        container[key] = self._redact_scalar(child, forced, stats)
+                        container[key] = self.redact_scalar(child, forced, stats)
             else:
                 for i, child in enumerate(container):
                     if isinstance(child, (dict, list)):
                         stack.append((child, inherited))
                     else:
-                        container[i] = self._redact_scalar(child, inherited, stats)
+                        container[i] = self.redact_scalar(child, inherited, stats)
         # ponytail: keys are classified, never rewritten. A PII-valued key
         # ({"bob@corp.example": {...}}) is left as-is; rewriting keys can merge
         # distinct keys under REPLACE mode. Add key redaction with a collision
@@ -333,41 +349,52 @@ class StructuredRedactor:
         *,
         strict: bool = False,
     ) -> RedactedRecord:
-        """Redact one log record (a JSON document, or arbitrary text).
+        """Redact one log record: a JSON document, an XML document, or free text.
 
-        ``bytes`` are parsed directly, so Kafka payloads skip a decode/encode
-        round trip on the hot path. Output is compact UTF-8 JSON with key order
-        preserved.
+        A record whose first non-blank character is ``<`` is handled as XML
+        (see :mod:`.xml_ast`); anything else as JSON. ``bytes`` are parsed
+        directly, so Kafka payloads skip a decode/encode round trip on the hot
+        path. JSON output is compact UTF-8 with key order preserved.
 
         A record that cannot be processed structurally (bad syntax, invalid
-        UTF-8, nesting deeper than 254 levels) is redacted as free text by the
-        OSS engine, so it still never passes through unredacted. With
-        ``strict=True`` it raises :class:`StructuredParseError` instead, for
-        pipelines that route malformed records elsewhere (the Kafka DLQ).
+        UTF-8, a DTD in XML, nesting deeper than 254 levels) is redacted as
+        free text by the OSS engine, so it still never passes through
+        unredacted. With ``strict=True`` it raises
+        :class:`StructuredParseError` instead, for pipelines that route
+        malformed records elsewhere (the Kafka DLQ).
         """
-        try:
-            tree: JSONValue = orjson.loads(line)
-        except orjson.JSONDecodeError as exc:
-            # Position only: the message must never quote the record.
-            return self._unstructured(line, stats, strict, f"not valid JSON (byte {exc.pos})")
-
         # Count into a scratch object and merge only on success, so a record
-        # that falls back to the text path below is never counted twice.
+        # that falls back to the text path is never counted twice.
         local = RedactionStats() if stats is not None else None
-        self.redact_tree(tree, local)
         try:
-            # ponytail: orjson reads integers wider than 64 bits as floats, so a
-            # 30-digit numeric ID loses precision on the way through. Producers
-            # should send such IDs as strings (they are then scanned as text).
-            out = orjson.dumps(tree)
-        except orjson.JSONEncodeError:
-            # orjson serialises at most 254 levels of nesting (it parses 1024).
-            return self._unstructured(line, stats, strict, "nested deeper than 254 levels")
+            if looks_like_xml(line):
+                out = redact_xml(self, line, local)
+            else:
+                out = self._redact_json(line, local)
+        except (_NotJSON, XMLRejected) as exc:
+            return self._unstructured(line, stats, strict, str(exc))
         if stats is not None and local is not None:
             stats.merge(local)  # per-type counts from the walk
             stats.chars_in += len(line)  # sizes are per record
             stats.chars_out += len(out)
         return RedactedRecord(out, structured=True)
+
+    def _redact_json(self, line: str | bytes, stats: RedactionStats | None) -> bytes:
+        """Parse, redact and re-serialise one JSON record (raises :class:`_NotJSON`)."""
+        try:
+            tree: JSONValue = orjson.loads(line)
+        except orjson.JSONDecodeError as exc:
+            # Position only: the message must never quote the record.
+            raise _NotJSON(f"not valid JSON (byte {exc.pos})") from None
+        self.redact_tree(tree, stats)
+        try:
+            # ponytail: orjson reads integers wider than 64 bits as floats, so a
+            # 30-digit numeric ID loses precision on the way through. Producers
+            # should send such IDs as strings (they are then scanned as text).
+            return orjson.dumps(tree)
+        except orjson.JSONEncodeError:
+            # orjson serialises at most 254 levels of nesting (it parses 1024).
+            raise _NotJSON("JSON nested deeper than 254 levels") from None
 
     def _unstructured(
         self, line: str | bytes, stats: RedactionStats | None, strict: bool, reason: str

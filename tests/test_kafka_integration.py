@@ -134,17 +134,18 @@ def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str]) -> N
             (b"bob@corp.example", json.dumps(PII_RECORD).encode()),
             (None, b"plain text, not json: alice@corp.example"),
             (b"user-42", None),  # tombstone
+            (None, b'<Event><Data Name="TargetUserName">bob</Data><Phone>555 0100</Phone></Event>'),
         ],
         headers=[("fwd", b"token for bob@corp.example")],
     )
 
     with Running(config):
-        egress = drain(topics["egress"], 2)
+        egress = drain(topics["egress"], 3)
         dlq = drain(topics["dlq"], 1)
 
     # Clean topic: JSON record redacted structurally; key and header redacted too.
-    assert len(egress) == 2, [m.value() for m in egress]
-    record, tombstone = egress
+    assert len(egress) == 3, [m.value() for m in egress]
+    record, tombstone, xml_record = egress
     assert json.loads(record.value()) == {
         "LastName": "[REDACTED]",
         "password": "[REDACTED]",
@@ -154,8 +155,13 @@ def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str]) -> N
     headers = dict(record.headers() or [])
     assert headers == {"fwd": b"token for [REDACTED]", "x-safestream-redaction": b"structural"}
     assert tombstone.value() is None and tombstone.key() == b"user-42"
+    # XML is redacted structurally too, on the same field rules.
+    assert xml_record.value() == (
+        b'<Event><Data Name="TargetUserName">[REDACTED]</Data><Phone>[REDACTED]</Phone></Event>'
+    )
+    assert dict(xml_record.headers() or [])["x-safestream-redaction"] == b"structural"
 
-    # DLQ: the non-JSON record, untouched, tagged with the exception class only.
+    # DLQ: the unparseable record, untouched, tagged with the exception class only.
     assert len(dlq) == 1
     assert dlq[0].value() == b"plain text, not json: alice@corp.example"
     assert dict(dlq[0].headers() or [])["x-safestream-error"] == b"StructuredParseError"
@@ -167,9 +173,9 @@ def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str]) -> N
     # the new record is processed and nothing earlier is replayed.
     produce(topics["ingress"], [(None, b'{"email": "carol@corp.example"}')])
     with Running(config):
-        egress = drain(topics["egress"], 3)
-    assert len(egress) == 3, "earlier records were replayed or the new one was lost"
-    assert json.loads(egress[2].value()) == {"email": "[REDACTED]"}
+        egress = drain(topics["egress"], 4)
+    assert len(egress) == 4, "earlier records were replayed or the new one was lost"
+    assert json.loads(egress[3].value()) == {"email": "[REDACTED]"}
     assert committed_lag(group, topics["ingress"]) == 0
 
 
