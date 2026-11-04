@@ -1,4 +1,9 @@
-"""Structure-aware (AST) redaction for JSON / NDJSON log records.
+"""Structure-aware (AST) redaction for JSON / NDJSON and XML log records.
+
+:class:`StructuredRedactor` is the single entry point for structured records:
+:meth:`~StructuredRedactor.redact_line` sends a record whose first non-blank
+character is ``<`` to the XML module (:mod:`.xml_ast`), and everything else
+to the JSON path below. Both use the same field rules.
 
 Why this exists
 ---------------
@@ -23,13 +28,19 @@ Two passes over every value, both fail-closed
    scanned by the core engine, so ``{"msg": "login by bob@corp.example"}`` is
    caught exactly as the OSS CLI would catch it.
 
-A line that is not valid JSON is never passed through: it falls back to the
-OSS text path (``Redactor.redact``), so mixed-format streams are always covered.
+A line that is neither valid JSON nor valid XML is never passed through: by default it falls back
+to the OSS free-text path, so mixed-format streams are always covered; with
+``strict=True`` it raises :class:`StructuredParseError` so the caller can route
+it elsewhere (the Kafka connector sends it to its DLQ).
 
 Replacement text comes from the engine's own :class:`RedactionPolicy`, so
-``replace`` / ``mask`` / ``pseudonymize`` / ``hash`` / ``encrypt`` behave
-identically for structural and textual hits, and pseudonyms stay joinable
-across both paths.
+``replace`` / ``mask`` / ``pseudonymize`` behave identically for structural and
+textual hits, and pseudonyms stay joinable across both paths.
+
+Parsing and serialisation use ``orjson`` (Rust): several times faster than the
+stdlib ``json`` module, it emits compact UTF-8 ``bytes`` directly (what Kafka
+wants) and bounds nesting depth (254 levels round-trip), which caps the cost of
+hostile input. Deeper records are treated as malformed.
 
 Memory: one record at a time. :meth:`StructuredRedactor.redact_lines` is a
 generator, so an NDJSON stream of any size runs in O(largest record) memory.
@@ -37,20 +48,25 @@ generator, so an NDJSON stream of any size runs in O(largest record) memory.
 
 from __future__ import annotations
 
-import json
 import re
 from collections.abc import Iterable, Iterator, Mapping
-from fnmatch import fnmatchcase
+from fnmatch import translate
 from functools import lru_cache
 from typing import NamedTuple, TypeAlias
 
+import orjson
 from safestream_redactor import Detection, EntityType, RedactionStats, Redactor
 
-#: Any value ``json.loads`` can produce.
+from safestream_enterprise.parsers.xml_ast import XMLRejected, looks_like_xml, redact_xml
+
+#: Any value ``orjson.loads`` can produce.
 JSONValue: TypeAlias = "dict[str, JSONValue] | list[JSONValue] | str | int | float | bool | None"
 
 #: ``Detection.source`` stamped on structural hits, so reports can tell them apart.
 STRUCTURAL_SOURCE = "structural"
+
+#: Prefix marking a field rule as a regular expression instead of a glob.
+REGEX_PREFIX = "re:"
 
 # Key normalisation strips everything but letters/digits, so one rule matches
 # every spelling: ``LastName``, ``last_name``, ``last-name``, ``LAST NAME``.
@@ -58,13 +74,14 @@ STRUCTURAL_SOURCE = "structural"
 _KEY_STRIP = re.compile(r"[^0-9a-z]+")
 _RULE_STRIP = re.compile(r"[^0-9a-z*?]+")
 
-#: Default field rules, evaluated in order, first match wins. Entity types are
-#: limited to those in the published ``safestream-redactor`` 0.4.x API; usernames,
-#: IBANs and street addresses move to their dedicated types once the OSS release
-#: carrying ``USERNAME``/``IBAN``/``ADDRESS`` ships. Patterns are
-#: globs over the *normalised* key (see above). They are deliberately specific:
-#: a bare ``*name*`` would also redact ``hostname``/``filename``/``service_name``
-#: and destroy the operational value of every log line.
+#: Default field rules, evaluated in order, first match wins. Patterns are globs
+#: over the *normalised* key (see above). They are deliberately specific: a bare
+#: ``*name*`` would also redact ``hostname``/``filename``/``service_name`` and
+#: destroy the operational value of every log line.
+#:
+#: Entity types are limited to the published ``safestream-redactor`` 0.4.x API:
+#: usernames, IBANs and street addresses move to dedicated types once the OSS
+#: release carrying ``USERNAME``/``IBAN``/``ADDRESS`` ships.
 DEFAULT_FIELD_RULES: Mapping[str, EntityType] = {
     # --- credentials (PCI-DSS 8, SOC 2 CC6) ---------------------------------
     "*password*": EntityType.SECRET,
@@ -144,16 +161,30 @@ DEFAULT_FIELD_RULES: Mapping[str, EntityType] = {
 }
 
 
+class StructuredParseError(ValueError):
+    """A record is neither valid JSON nor valid XML, and the caller asked for strict parsing."""
+
+
+class _NotJSON(ValueError):
+    """Internal: the JSON path cannot process this record (the message says why)."""
+
+
 class RedactedRecord(NamedTuple):
     """One redacted record.
 
-    ``structured`` is ``False`` when the input was not valid JSON and the OSS
-    free-text path redacted it instead; connectors surface this as a header so
-    downstream consumers know whether the record's shape was preserved.
+    ``data`` is the redacted record as UTF-8 bytes (compact JSON, or XML, when
+    ``structured``). ``structured`` is ``False`` when the input was neither
+    valid JSON nor valid XML and the OSS free-text path redacted it instead; connectors surface this
+    as a header so consumers know whether the record's shape was preserved.
     """
 
-    text: str
+    data: bytes
     structured: bool
+
+    @property
+    def text(self) -> str:
+        """``data`` decoded, for callers working in ``str``."""
+        return self.data.decode("utf-8")
 
 
 def _normalise_key(key: str) -> str:
@@ -169,8 +200,12 @@ class StructuredRedactor:
         The OSS engine. Its detectors scan free-text values and its ``policy``
         renders every replacement. Defaults to ``Redactor()``.
     field_rules:
-        Ordered ``glob -> entity type`` map applied to normalised keys; first
-        match wins. Entity types may be given by name (``"email"``).
+        Ordered ``pattern -> entity type`` map; first match wins. A plain
+        pattern is a glob matched against the *normalised* key (lower-case,
+        letters and digits only), so ``*last_name*`` matches ``LastName``. A
+        pattern starting with ``re:`` is a regular expression searched in the
+        *raw* key, case-insensitively (``re:^x-.*-token$``). Entity types may
+        be given by name (``"email"``).
     scan_free_text:
         Also run the OSS detectors over values whose key matched no rule.
         Disable only for records whose schema is fully covered by rules.
@@ -189,14 +224,22 @@ class StructuredRedactor:
     ) -> None:
         self.redactor = redactor if redactor is not None else Redactor()
         self.scan_free_text = scan_free_text
-        # Normalise each pattern exactly like keys, so ``*Last_Name*`` works.
-        self._rules: tuple[tuple[str, EntityType], ...] = tuple(
-            (
-                _RULE_STRIP.sub("", pattern.lower()),
-                et if isinstance(et, EntityType) else EntityType.from_name(et),
-            )
-            for pattern, et in field_rules.items()
-        )
+        # Compile every rule once. Each entry: (regex, matches_raw_key, type).
+        # Globs are normalised exactly like keys, so ``*Last_Name*`` works.
+        rules: list[tuple[re.Pattern[str], bool, EntityType]] = []
+        for pattern, et in field_rules.items():
+            entity_type = et if isinstance(et, EntityType) else EntityType.from_name(et)
+            if pattern.startswith(REGEX_PREFIX):
+                try:
+                    regex = re.compile(pattern[len(REGEX_PREFIX) :], re.IGNORECASE)
+                except re.error as exc:
+                    # Fail at startup, not on the first matching record mid-stream.
+                    raise ValueError(f"invalid field rule {pattern!r}: {exc}") from None
+                rules.append((regex, True, entity_type))
+            else:
+                glob = _RULE_STRIP.sub("", pattern.lower())
+                rules.append((re.compile(translate(glob)), False, entity_type))
+        self._rules: tuple[tuple[re.Pattern[str], bool, EntityType], ...] = tuple(rules)
         # Per-instance cache (a module-level one would leak rules across
         # instances). lru_cache is thread-safe for concurrent readers.
         self.classify_key = lru_cache(maxsize=key_cache_size)(self._classify_key)
@@ -208,8 +251,8 @@ class StructuredRedactor:
     def _classify_key(self, key: str) -> EntityType | None:
         """The entity type a key's value is redacted as, or ``None``."""
         norm = _normalise_key(key)
-        for pattern, entity_type in self._rules:
-            if fnmatchcase(norm, pattern):
+        for regex, raw, entity_type in self._rules:
+            if regex.search(key) if raw else regex.match(norm):
                 return entity_type
         return None
 
@@ -217,13 +260,18 @@ class StructuredRedactor:
     # value rewriting
     # ------------------------------------------------------------------
 
-    def _redact_scalar(
+    def redact_scalar(
         self,
         value: JSONValue,
         forced: EntityType | None,
         stats: RedactionStats | None,
     ) -> JSONValue:
-        """Return the redacted replacement for one leaf value."""
+        """Return the redacted replacement for one leaf value.
+
+        ``forced`` is the entity type from a matching field rule (the whole
+        value is redacted) or ``None`` (the value is scanned by the OSS
+        detectors). Shared by the JSON and XML walks.
+        """
         # bool before int: bool is an int subclass, and true/false/null carry
         # no payload worth hiding — keeping them preserves the record's shape.
         if value is None or isinstance(value, bool):
@@ -254,13 +302,15 @@ class StructuredRedactor:
     def redact_tree(self, root: JSONValue, stats: RedactionStats | None = None) -> JSONValue:
         """Redact a parsed JSON tree **in place** and return it.
 
-        Iterative (explicit stack), so record depth never touches Python's
-        recursion limit. Each work item is a container plus the entity type
+        The traversal is depth-first like a recursive walk, but uses an explicit
+        stack: orjson parses up to 1024 levels of nesting, more than Python's
+        default recursion limit, so a recursive walk could crash on input the
+        parser accepted. Each work item is a container plus the entity type
         inherited from a sensitive ancestor key (``None`` if there is none).
         ``stats`` receives per-entity-type counts only.
         """
         if not isinstance(root, (dict, list)):
-            return self._redact_scalar(root, None, stats)
+            return self.redact_scalar(root, None, stats)
 
         stack: list[tuple[dict[str, JSONValue] | list[JSONValue], EntityType | None]] = [
             (root, None)
@@ -275,13 +325,13 @@ class StructuredRedactor:
                     if isinstance(child, (dict, list)):
                         stack.append((child, forced))
                     else:
-                        container[key] = self._redact_scalar(child, forced, stats)
+                        container[key] = self.redact_scalar(child, forced, stats)
             else:
                 for i, child in enumerate(container):
                     if isinstance(child, (dict, list)):
                         stack.append((child, inherited))
                     else:
-                        container[i] = self._redact_scalar(child, inherited, stats)
+                        container[i] = self.redact_scalar(child, inherited, stats)
         # ponytail: keys are classified, never rewritten. A PII-valued key
         # ({"bob@corp.example": {...}}) is left as-is; rewriting keys can merge
         # distinct keys under REPLACE mode. Add key redaction with a collision
@@ -292,33 +342,72 @@ class StructuredRedactor:
     # line / stream API
     # ------------------------------------------------------------------
 
-    def redact_line(self, line: str | bytes, stats: RedactionStats | None = None) -> RedactedRecord:
-        """Redact one log record (a JSON document or arbitrary text).
+    def redact_line(
+        self,
+        line: str | bytes,
+        stats: RedactionStats | None = None,
+        *,
+        strict: bool = False,
+    ) -> RedactedRecord:
+        """Redact one log record: a JSON document, an XML document, or free text.
 
-        ``bytes`` are accepted directly (``json.loads`` sniffs UTF-8/16/32), so
-        Kafka payloads skip a decode/encode round trip on the hot path.
-        Output is compact JSON with key order preserved and non-ASCII kept.
+        A record whose first non-blank character is ``<`` is handled as XML
+        (see :mod:`.xml_ast`); anything else as JSON. ``bytes`` are parsed
+        directly, so Kafka payloads skip a decode/encode round trip on the hot
+        path. JSON output is compact UTF-8 with key order preserved.
+
+        A record that cannot be processed structurally (bad syntax, invalid
+        UTF-8, a DTD in XML, nesting deeper than 254 levels) is redacted as
+        free text by the OSS engine, so it still never passes through
+        unredacted. With ``strict=True`` it raises
+        :class:`StructuredParseError` instead, for pipelines that route
+        malformed records elsewhere (the Kafka DLQ).
         """
+        # Count into a scratch object and merge only on success, so a record
+        # that falls back to the text path is never counted twice.
+        local = RedactionStats() if stats is not None else None
         try:
-            tree: JSONValue = json.loads(line)
-        except (ValueError, RecursionError):
-            # ValueError covers JSONDecodeError and UnicodeDecodeError.
-            # RecursionError: hostile nesting deeper than the C parser allows.
-            # Either way, fail closed through the OSS free-text engine.
-            text = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
-            detections = self.redactor.detect(text)
-            redacted = self.redactor.policy.apply(text, detections)
-            if stats is not None:
-                stats.add_segment(text, redacted, detections)
-            return RedactedRecord(redacted, structured=False)
-
-        self.redact_tree(tree, stats)
-        out = json.dumps(tree, ensure_ascii=False, separators=(",", ":"))
-        if stats is not None:
-            # per-type counts were added during the walk; sizes are per record
-            stats.chars_in += len(line)
+            if looks_like_xml(line):
+                out = redact_xml(self, line, local)
+            else:
+                out = self._redact_json(line, local)
+        except (_NotJSON, XMLRejected) as exc:
+            return self._unstructured(line, stats, strict, str(exc))
+        if stats is not None and local is not None:
+            stats.merge(local)  # per-type counts from the walk
+            stats.chars_in += len(line)  # sizes are per record
             stats.chars_out += len(out)
         return RedactedRecord(out, structured=True)
+
+    def _redact_json(self, line: str | bytes, stats: RedactionStats | None) -> bytes:
+        """Parse, redact and re-serialise one JSON record (raises :class:`_NotJSON`)."""
+        try:
+            tree: JSONValue = orjson.loads(line)
+        except orjson.JSONDecodeError as exc:
+            # Position only: the message must never quote the record.
+            raise _NotJSON(f"not valid JSON (byte {exc.pos})") from None
+        self.redact_tree(tree, stats)
+        try:
+            # ponytail: orjson reads integers wider than 64 bits as floats, so a
+            # 30-digit numeric ID loses precision on the way through. Producers
+            # should send such IDs as strings (they are then scanned as text).
+            return orjson.dumps(tree)
+        except orjson.JSONEncodeError:
+            # orjson serialises at most 254 levels of nesting (it parses 1024).
+            raise _NotJSON("JSON nested deeper than 254 levels") from None
+
+    def _unstructured(
+        self, line: str | bytes, stats: RedactionStats | None, strict: bool, reason: str
+    ) -> RedactedRecord:
+        """Fail closed for a record that can't be handled as JSON."""
+        if strict:
+            raise StructuredParseError(f"record is {reason}")
+        text = line.decode("utf-8", errors="replace") if isinstance(line, bytes) else line
+        detections = self.redactor.detect(text)
+        redacted = self.redactor.policy.apply(text, detections)
+        if stats is not None:
+            stats.add_segment(text, redacted, detections)
+        return RedactedRecord(redacted.encode("utf-8"), structured=False)
 
     def redact_lines(
         self, lines: Iterable[str | bytes], stats: RedactionStats | None = None

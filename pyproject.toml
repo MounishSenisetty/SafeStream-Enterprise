@@ -21,12 +21,16 @@ dependencies = [
   # Pinned to the minor series whose public API (Redactor, RedactionPolicy,
   # Detection, RedactionStats) this package is written against.
   "safestream-redactor>=0.4.0,<0.5",
+  # Kafka connector; librdkafka is bundled inside the wheel.
+  "confluent-kafka>=2.3,<3",
+  # Validated, secret-safe connector configuration.
+  "pydantic>=2.6,<3",
+  # Rust JSON parser/serialiser for the structured redaction hot path.
+  "orjson>=3.10,<4",
 ]
 
 [project.optional-dependencies]
-# Kafka sidecar/consumer (connectors/kafka.py). librdkafka ships inside the wheel.
-kafka = ["confluent-kafka>=2.3,<3"]
-dev = ["pytest>=7", "mypy>=1.8", "ruff>=0.15,<0.16", "confluent-kafka>=2.3,<3"]
+dev = ["pytest>=7", "mypy>=1.8", "ruff>=0.15,<0.16"]
 
 [project.scripts]
 safestream-kafka = "safestream_enterprise.connectors.kafka:main"
@@ -52,6 +56,7 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
 python_version = "3.12"
 strict = true
 files = ["src"]
+plugins = ["pydantic.mypy"]
 
 [[tool.mypy.overrides]]
 # confluent-kafka ships partial stubs; tolerate gaps rather than vendoring our own.
