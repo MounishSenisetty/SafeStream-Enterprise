@@ -162,6 +162,8 @@ with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
 | `SAFESTREAM_UNPARSEABLE` | `dlq` | Payloads that are neither JSON nor XML. `dlq`: send them to the DLQ. `redact_text`: text-redact them and deliver them to egress |
 | `SAFESTREAM_DELIVERY` | `at_least_once` | `at_least_once` or `exactly_once` (one transaction per batch; needs transactional-ID write permission on the brokers) |
 | `SAFESTREAM_FIELD_RULES_FILE` | none | JSON file of customer field rules, usually a mounted ConfigMap. See [Custom field rules](#custom-field-rules) |
+| `SAFESTREAM_METRICS_PORT` | `9400` | Port for `/healthz`, `/readyz` and `/metrics`; `0` turns the endpoint off. See [Monitoring](#monitoring) |
+| `SAFESTREAM_LIVENESS_TIMEOUT_S` | `120` | `/healthz` fails once the main loop hasn't advanced for this long. Must be at least twice `SAFESTREAM_FLUSH_TIMEOUT_S` |
 | `SAFESTREAM_TRANSACTIONAL_ID` | `<group id>-<hostname>` | Exactly-once only. The default (the pod name on Kubernetes) is unique per instance, which is all exactly-once needs |
 | `SAFESTREAM_BATCH_SIZE` | `500` | Records per commit (per transaction in exactly-once mode) |
 | `SAFESTREAM_FLUSH_TIMEOUT_S` | `30` | Maximum wait for egress acknowledgements per batch |
@@ -210,6 +212,33 @@ from safestream_enterprise import StructuredRedactor, load_field_rules
 redactor = StructuredRedactor(field_rules=load_field_rules("field-rules.json"))
 ```
 
+### Monitoring
+
+The connector serves three endpoints on `SAFESTREAM_METRICS_PORT` (default 9400). The
+Kubernetes manifest wires them up as probes and for Prometheus scraping.
+
+| Endpoint | Meaning |
+|---|---|
+| `/healthz` | Liveness. Fails only if the main loop stops advancing (a wedged process), so Kubernetes restarts it. A broker outage does **not** fail it, because a restart can't fix the brokers. |
+| `/readyz` | Readiness. Passes once the connector has subscribed; fails during shutdown. |
+| `/metrics` | Prometheus text format. |
+
+| Metric | Type | Description |
+|---|---|---|
+| `safestream_records_total{destination="egress"\|"dlq"}` | counter | Records published to the clean and dead-letter topics |
+| `safestream_redactions_total{entity_type="..."}` | counter | Values redacted, by entity type: compliance evidence of what the pipeline removed |
+| `safestream_batches_total` | counter | Batches committed |
+| `safestream_transaction_aborts_total` | counter | Aborted transactions (exactly-once); a sustained rate points at broker trouble |
+| `safestream_heartbeat_age_seconds` | gauge | Seconds since the main loop last advanced |
+| `safestream_ready` | gauge | 1 while consuming |
+
+Useful alerts include a rising `dlq` rate (producers sending malformed records) and
+`transaction_aborts_total` increasing. Consumer lag comes from your usual Kafka exporter,
+for example kafka-exporter or Burrow, under group `KAFKA_GROUP_ID`.
+
+The endpoint carries counts only, never record content, keys or headers, and it never logs
+requests. The NetworkPolicy lets only the `monitoring` namespace reach the port.
+
 ## Security model
 
 - **Fail closed.** A record that is neither JSON nor XML, or that fails processing, goes to the restricted
@@ -225,7 +254,8 @@ redactor = StructuredRedactor(field_rules=load_field_rules("field-rules.json"))
   payloads. The DLQ records only the exception class, never its message.
 - **Hardened runtime.** The image is distroless: no shell, no package manager. The container
   runs as non-root on a read-only root filesystem with all Linux capabilities dropped. A
-  default-deny NetworkPolicy allows egress only to the Kafka brokers (port 9092) and DNS.
+  default-deny NetworkPolicy allows egress only to the Kafka brokers (port 9092) and DNS, and
+  ingress only from the `monitoring` namespace to the metrics port.
 - **No plugin code by default.** Third-party detector plugins are disabled in the service.
 
 ## Repository layout

@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -44,6 +47,21 @@ def topics() -> Iterator[dict[str, str]]:
         future.result(30)
     yield names
     admin.delete_topics(list(names.values()))
+
+
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def http_get(port: int, path: str) -> tuple[int, str]:
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # loopback
+    try:
+        with opener.open(f"http://127.0.0.1:{port}{path}", timeout=10) as resp:
+            return resp.status, resp.read().decode()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode()
 
 
 def produce(topic: str, records: list[tuple[bytes | None, bytes | None]], **kw: object) -> None:
@@ -145,9 +163,14 @@ def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str], deli
         headers=[("fwd", b"token for bob@corp.example")],
     )
 
-    with Running(config):
+    with Running(config) as connector:
         egress = drain(topics["egress"], 3)
         dlq = drain(topics["dlq"], 1)
+        # /metrics view of the same run: JSON record, tombstone and XML record
+        # to egress, the unparseable record to the DLQ, no aborted transactions
+        m = connector.snapshot()
+        assert (m.egress_records, m.dlq_records, m.transaction_aborts) == (3, 1, 0)
+        assert m.ready and m.batches >= 1 and m.redactions["person"] >= 1
 
     # Clean topic: JSON record redacted structurally; key and header redacted too.
     assert len(egress) == 3, [m.value() for m in egress]
@@ -195,6 +218,7 @@ def test_container_image_under_kubernetes_restrictions(
     rules = tmp_path / "field-rules.json"
     rules.write_text(json.dumps({"rules": {"*loyalty_number*": "id_number"}}), encoding="utf-8")
     rules.chmod(0o644)  # readable by the image's non-root user
+    metrics_port = free_port()
     env = {
         "KAFKA_BOOTSTRAP_SERVERS": BOOTSTRAP,
         "KAFKA_GROUP_ID": name,
@@ -206,6 +230,7 @@ def test_container_image_under_kubernetes_restrictions(
         # transactional.id derived from the container hostname, as on Kubernetes
         "SAFESTREAM_DELIVERY": "exactly_once",
         "SAFESTREAM_FIELD_RULES_FILE": "/etc/safestream/field-rules.json",
+        "SAFESTREAM_METRICS_PORT": str(metrics_port),
     }
     run = ["docker", "run", "-d", "--name", name, "--network", "host", "--read-only"]
     run += ["--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65532:65532"]
@@ -222,6 +247,15 @@ def test_container_image_under_kubernetes_restrictions(
         assert out["LastName"].startswith("<PERSON_") and out["password"].startswith("<SECRET_")
         # the mounted customer rule applied; it is not a built-in rule
         assert out["loyaltyNumber"].startswith("<ID_NUMBER_")
+
+        # probes and metrics, as kubelet and Prometheus would read them
+        assert http_get(metrics_port, "/healthz") == (200, "ok\n")
+        assert http_get(metrics_port, "/readyz") == (200, "ready\n")
+        status, metrics = http_get(metrics_port, "/metrics")
+        assert status == 200
+        assert 'safestream_records_total{destination="egress"} 1' in metrics
+        assert 'safestream_redactions_total{entity_type="id_number"} 1' in metrics
+        assert "L-4242-77" not in metrics and "Smith" not in metrics
         assert "Smith" not in egress[0].value().decode()
 
         # SIGTERM (what Kubernetes sends) drains and exits 0.

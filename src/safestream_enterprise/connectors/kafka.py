@@ -62,6 +62,7 @@ import os
 import signal
 import socket
 import sys
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from types import FrameType
@@ -79,6 +80,7 @@ from confluent_kafka import (
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from safestream_redactor import RedactionMode, RedactionPolicy, RedactionStats, Redactor
 
+from safestream_enterprise.connectors.health import ConnectorMetrics, HealthServer
 from safestream_enterprise.parsers.json_ast import DEFAULT_FIELD_RULES, StructuredRedactor
 from safestream_enterprise.rules import load_field_rules
 
@@ -134,6 +136,10 @@ class ConnectorConfig(BaseModel):
     #: JSON file of customer field rules (see :mod:`safestream_enterprise.rules`),
     #: typically a mounted ConfigMap. ``None`` uses the built-in rules only.
     field_rules_file: Path | None = None
+    #: Port for /healthz, /readyz and /metrics (see :mod:`.health`); 0 disables.
+    metrics_port: int = Field(default=9400, ge=0, le=65535)
+    #: /healthz fails once the main loop has not advanced for this long.
+    liveness_timeout_s: float = Field(default=120.0, gt=0)
     #: Extra librdkafka properties applied to both consumer and producer
     #: (security.protocol, sasl.*, ssl.* ...). Secret-wrapped: may hold passwords.
     client_overrides: dict[str, SecretStr] = Field(default_factory=dict)
@@ -151,6 +157,12 @@ class ConnectorConfig(BaseModel):
         if self.transactional_id and self.delivery != "exactly_once":
             raise ValueError(
                 "SAFESTREAM_TRANSACTIONAL_ID requires SAFESTREAM_DELIVERY=exactly_once"
+            )
+        # The heartbeat can legitimately pause for one flush/commit wait; a
+        # liveness window shorter than that would restart healthy pods.
+        if self.liveness_timeout_s < 2 * self.flush_timeout_s:
+            raise ValueError(
+                "SAFESTREAM_LIVENESS_TIMEOUT_S must be at least twice SAFESTREAM_FLUSH_TIMEOUT_S"
             )
         return self
 
@@ -180,6 +192,8 @@ class ConnectorConfig(BaseModel):
             "SAFESTREAM_DELIVERY": "delivery",
             "SAFESTREAM_TRANSACTIONAL_ID": "transactional_id",
             "SAFESTREAM_FIELD_RULES_FILE": "field_rules_file",
+            "SAFESTREAM_METRICS_PORT": "metrics_port",
+            "SAFESTREAM_LIVENESS_TIMEOUT_S": "liveness_timeout_s",
         }
         data: dict[str, object] = {field: env[var] for var, field in names.items() if env.get(var)}
         data["client_overrides"] = {
@@ -243,9 +257,28 @@ class KafkaRedactionConnector:
         self.consumer = consumer
         self.producer = producer
         self.stats = RedactionStats()
+        # Content-free counters for /metrics (read from the health thread;
+        # plain int/attribute reads are atomic under the GIL).
+        self.egress_records = 0
         self.dead_lettered = 0
+        self.batches = 0
+        self.transaction_aborts = 0
+        self.ready = False
+        self.heartbeat = time.monotonic()
         self._running = True
         self._delivery_errors: list[KafkaError] = []
+
+    def snapshot(self) -> ConnectorMetrics:
+        """A content-free view for the health/metrics endpoint."""
+        return ConnectorMetrics(
+            ready=self.ready,
+            heartbeat=self.heartbeat,
+            egress_records=self.egress_records,
+            dlq_records=self.dead_lettered,
+            batches=self.batches,
+            transaction_aborts=self.transaction_aborts,
+            redactions=dict(self.stats.counts),
+        )
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -263,6 +296,7 @@ class KafkaRedactionConnector:
             # previous instance with the same id left open.
             self.producer.init_transactions(self.config.flush_timeout_s)
         self.consumer.subscribe([self.config.ingress_topic])
+        self.ready = True
         logger.info(
             "consuming %s -> %s (group=%s, delivery=%s)",
             self.config.ingress_topic,
@@ -272,12 +306,14 @@ class KafkaRedactionConnector:
         )
         try:
             while self._running:
+                self.heartbeat = time.monotonic()
                 batch = self.consumer.consume(
                     num_messages=self.config.batch_size, timeout=self.config.poll_timeout_s
                 )
                 if batch:
                     self.process_batch(batch)
         finally:
+            self.ready = False
             # Order matters: flush in-flight egress first, then close the consumer
             # (which leaves the group so partitions rebalance immediately).
             self.producer.flush(self.config.flush_timeout_s)
@@ -357,6 +393,7 @@ class KafkaRedactionConnector:
             # record exceeds message.max.bytes) would otherwise crash-loop on
             # this one record forever.
             self._produce(self.config.egress_topic, out_value, out_key, out_headers, timestamp)
+            self.egress_records += 1
         except Exception as exc:  # any per-record failure: DLQ, never egress
             self._dead_letter(msg, value, key, raw_headers, timestamp, exc)
 
@@ -411,6 +448,8 @@ class KafkaRedactionConnector:
             self.handle_message(msg)
             # Serve delivery callbacks so the local queue keeps draining.
             self.producer.poll(0)
+            # A large batch is progress, not a stall: keep liveness fresh.
+            self.heartbeat = time.monotonic()
 
     def _process_at_least_once(self, messages: list[Message]) -> None:
         self._publish(messages)
@@ -424,6 +463,7 @@ class KafkaRedactionConnector:
             )
         # Synchronous: when this returns, a restart resumes after this batch.
         self.consumer.commit(asynchronous=False)
+        self.batches += 1
 
     def _process_transactional(self, messages: list[Message]) -> None:
         """Publish ``messages`` and commit their offsets in one transaction.
@@ -435,7 +475,7 @@ class KafkaRedactionConnector:
         offsets = _next_offsets(messages)
         for attempt in range(1, MAX_TRANSACTION_ATTEMPTS + 1):
             # Counters are restored on abort so a retried batch isn't counted twice.
-            saved = (copy.deepcopy(self.stats), self.dead_lettered)
+            saved = (copy.deepcopy(self.stats), self.dead_lettered, self.egress_records)
             self.producer.begin_transaction()
             try:
                 self._publish(messages)
@@ -455,9 +495,11 @@ class KafkaRedactionConnector:
                 )
                 self.producer.abort_transaction(self.config.flush_timeout_s)
                 self._delivery_errors.clear()
-                self.stats, self.dead_lettered = saved
+                self.stats, self.dead_lettered, self.egress_records = saved
+                self.transaction_aborts += 1
                 continue
             self._delivery_errors.clear()
+            self.batches += 1
             return
         raise DeliveryError(
             f"transaction aborted {MAX_TRANSACTION_ATTEMPTS} times; offsets NOT committed, "
@@ -548,6 +590,15 @@ def main() -> int:
         Consumer(config.consumer_config()),
         Producer(config.producer_config()),
     )
+    health: HealthServer | None = None
+    if config.metrics_port:
+        try:
+            health = HealthServer(
+                connector.snapshot, config.metrics_port, config.liveness_timeout_s
+            ).start()
+        except OSError as exc:
+            logger.error("cannot serve health/metrics on port %d: %s", config.metrics_port, exc)
+            return 2
     # Kubernetes sends SIGTERM on scale-down/rollout; drain instead of dying mid-batch.
     signal.signal(signal.SIGTERM, connector.stop)
     signal.signal(signal.SIGINT, connector.stop)
@@ -556,6 +607,9 @@ def main() -> int:
     except (KafkaException, DeliveryError) as exc:
         logger.critical("unrecoverable Kafka error, exiting for restart: %s", exc)
         return 1
+    finally:
+        if health is not None:
+            health.stop()
     return 0
 
 
