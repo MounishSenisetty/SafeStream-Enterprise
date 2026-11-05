@@ -69,6 +69,9 @@ STRUCTURAL_SOURCE = "structural"
 #: Prefix marking a field rule as a regular expression instead of a glob.
 REGEX_PREFIX = "re:"
 
+#: Longest key whose classification is memoised (see ``classify_key``).
+MAX_CACHED_KEY_LENGTH = 256
+
 # Key normalisation strips everything but letters/digits, so one rule matches
 # every spelling: ``LastName``, ``last_name``, ``last-name``, ``LAST NAME``.
 # Rule patterns keep the glob wildcards ``*`` and ``?``.
@@ -251,11 +254,22 @@ class StructuredRedactor:
         self.rules_fingerprint = "sha256:" + hashlib.sha256(orjson.dumps(canonical)).hexdigest()
         # Per-instance cache (a module-level one would leak rules across
         # instances). lru_cache is thread-safe for concurrent readers.
-        self.classify_key = lru_cache(maxsize=key_cache_size)(self._classify_key)
+        self._classify_cached = lru_cache(maxsize=key_cache_size)(self._classify_key)
 
     # ------------------------------------------------------------------
     # key classification
     # ------------------------------------------------------------------
+
+    def classify_key(self, key: str) -> EntityType | None:
+        """The entity type a key's value is redacted as, or ``None``.
+
+        Keys come from untrusted records. Only short keys are memoised: real
+        schemas reuse a small set of short field names, while a hostile record
+        could otherwise fill the cache with megabyte-long keys and exhaust memory.
+        """
+        if len(key) <= MAX_CACHED_KEY_LENGTH:
+            return self._classify_cached(key)
+        return self._classify_key(key)
 
     def _classify_key(self, key: str) -> EntityType | None:
         """The entity type a key's value is redacted as, or ``None``."""

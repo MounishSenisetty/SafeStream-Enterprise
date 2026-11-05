@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["**"]  # tags are covered by release.yml, which calls this workflow
+    # PR branches are covered by pull_request (running both would double every
+    # run); tags by release.yml, which calls this workflow.
+    branches: [main]
   pull_request:
   workflow_dispatch:
   workflow_call:

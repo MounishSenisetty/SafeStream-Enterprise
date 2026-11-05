@@ -56,8 +56,10 @@ from safestream_enterprise.rules import make_redactor
 
 logger = logging.getLogger("safestream_enterprise.batch")
 
-#: Files picked up when an input is a directory (plain or gzipped).
-DEFAULT_INCLUDE = ("*.ndjson", "*.jsonl", "*.json", "*.log", "*.xml")
+#: Files picked up when an input is a directory (plain or gzipped). Only
+#: one-record-per-line formats: a pretty-printed ``.json`` or ``.xml`` document
+#: spans many lines, and redacting it line by line would bypass the field rules.
+DEFAULT_INCLUDE = ("*.ndjson", "*.jsonl", "*.log")
 
 
 class BatchError(Exception):
@@ -166,9 +168,13 @@ def plan(inputs: Sequence[str], output: str, include: Sequence[str]) -> list[tup
                 ]
             else:
                 pairs.append((src, out / src.name))
+    seen: dict[Path, Path] = {}
     for src, dst in pairs:
         if dst.resolve() == src.resolve():
             raise BatchError(f"output would overwrite its input: {src}")
+        first = seen.setdefault(dst.resolve(), src)
+        if first is not src:
+            raise BatchError(f"{first} and {src} would both be written to {dst}")
     out_resolved = out.resolve()
     for src in sources:
         if src.is_dir() and out_resolved.is_relative_to(src.resolve()):
@@ -262,6 +268,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         report.lines,
         report.stats.total,
     )
+    if report.text_fallback:
+        # Often the sign of multi-line (pretty-printed) JSON or XML, where no
+        # single line parses and field rules never apply.
+        logger.warning(
+            "%d line(s) were not one-line JSON or XML and got text redaction only; "
+            "field rules did not apply to them. This tool expects one record per line.",
+            report.text_fallback,
+        )
     return 0
 
 
