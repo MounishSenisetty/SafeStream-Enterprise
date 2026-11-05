@@ -53,6 +53,12 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: safestream-kafka-redactor
+      annotations:
+        # Annotation-based discovery; with the Prometheus Operator use a PodMonitor
+        # on the "metrics" port instead. /metrics carries counts, never content.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9400"
+        prometheus.io/path: /metrics
     spec:
       # Time to finish the in-flight batch, wait for egress acks and commit
       # after SIGTERM. Must exceed SAFESTREAM_FLUSH_TIMEOUT_S.
@@ -69,6 +75,10 @@ spec:
         - name: redactor
           image: ghcr.io/mounishsenisetty/safestream-enterprise:0.2.0
           imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9400
+              protocol: TCP
           env:
             - name: KAFKA_BOOTSTRAP_SERVERS
               value: "kafka-bootstrap.kafka.svc.cluster.local:9092"
@@ -108,6 +118,17 @@ spec:
             - name: SAFESTREAM_KAFKA_SASL_PASSWORD
               valueFrom:
                 secretKeyRef: { name: safestream-secrets, key: sasl-password }
+          # /healthz fails only when the main loop stops advancing (a wedged
+          # process), never because the brokers are down: a restart cannot fix
+          # the brokers. SAFESTREAM_LIVENESS_TIMEOUT_S (default 120s) bounds it.
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: metrics }
+            periodSeconds: 10
           resources:
             # Memory is flat: one batch of records at a time, regardless of topic volume.
             requests: { cpu: "500m", memory: "256Mi" }
@@ -143,8 +164,16 @@ spec:
     matchLabels:
       app.kubernetes.io/name: safestream-kafka-redactor
   policyTypes: [Ingress, Egress]
-  # No ingress rules: nothing may connect to the connector (it serves nothing).
-  ingress: []
+  # Ingress: only Prometheus may connect, and only to the metrics port.
+  # Kubelet health probes come from the node and are allowed by the CNIs in
+  # common use; if yours filters host traffic, allow the node CIDR on 9400.
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - { protocol: TCP, port: 9400 }
   egress:
     # Kafka brokers only: namespace AND pod label must both match (same list item).
     - to:

@@ -125,6 +125,10 @@ def test_redacts_value_key_headers_and_commits_after_ack() -> None:
     assert first["timestamp"] == 1700000000000
     assert tomb["value"] is None and tomb["key"] == b"k1"
     assert c.commits == 1
+    # /metrics view: counts only
+    m = conn.snapshot()
+    assert (m.egress_records, m.dlq_records, m.batches, m.transaction_aborts) == (2, 0, 1, 0)
+    assert m.redactions == {"email": 1}
 
 
 def test_delivery_failure_never_commits() -> None:
@@ -231,6 +235,9 @@ def test_config_from_env() -> None:
         {"SAFESTREAM_MODE": "pseudonymize"},  # no HMAC key
         {"SAFESTREAM_BATCH_SIZE": "0"},
         {"SAFESTREAM_UNPARSEABLE": "drop"},
+        # liveness shorter than two flush waits would restart healthy pods
+        {"SAFESTREAM_LIVENESS_TIMEOUT_S": "30"},
+        {"SAFESTREAM_METRICS_PORT": "70000"},
     ],
 )
 def test_config_rejects_unsafe_values(env: dict[str, str]) -> None:
@@ -341,6 +348,8 @@ def test_eos_abortable_error_retries_batch_without_duplicates_or_double_counting
     assert p.calls == [*attempt, "abort", *attempt]
     assert len(p.visible) == 3  # the aborted attempt is invisible
     assert conn.stats.counts["email"] == 1 and conn.dead_lettered == 1
+    m = conn.snapshot()  # the retried batch is counted once; the abort is counted
+    assert (m.egress_records, m.dlq_records, m.batches, m.transaction_aborts) == (2, 1, 1, 1)
 
 
 def test_eos_retriable_commit_is_retried_in_place() -> None:
