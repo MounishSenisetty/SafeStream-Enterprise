@@ -80,12 +80,12 @@ from confluent_kafka import (
     TopicPartition,
 )
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
-from safestream_redactor import RedactionMode, RedactionPolicy, RedactionStats, Redactor
+from safestream_redactor import RedactionMode, RedactionStats
 
 from safestream_enterprise import __version__
 from safestream_enterprise.connectors.health import ConnectorMetrics, HealthServer
-from safestream_enterprise.parsers.json_ast import DEFAULT_FIELD_RULES, StructuredRedactor
-from safestream_enterprise.rules import load_field_rules
+from safestream_enterprise.parsers.json_ast import StructuredRedactor
+from safestream_enterprise.rules import make_redactor
 
 logger = logging.getLogger("safestream_enterprise.kafka")
 
@@ -680,7 +680,7 @@ def _next_offsets(messages: list[Message]) -> list[TopicPartition]:
 
 
 def build_redactor(config: ConnectorConfig) -> StructuredRedactor:
-    """The structured redactor for ``config``.
+    """The structured redactor for ``config``, built by :func:`.rules.make_redactor`.
 
     ``hmac_key`` keys pseudonymize mode so the same customer maps to the same
     token across every topic and day. Mount it from a Secret; never bake it
@@ -691,28 +691,12 @@ def build_redactor(config: ConnectorConfig) -> StructuredRedactor:
     the same rules. Raises ``ValueError`` (``FieldRulesError``) on a bad file.
     """
     key = config.hmac_key.get_secret_value().encode() if config.hmac_key else None
-    policy = RedactionPolicy(mode=config.redaction_mode, hmac_key=key)
-    rules = (
-        load_field_rules(config.field_rules_file)
-        if config.field_rules_file
-        else DEFAULT_FIELD_RULES
-    )
+    redactor = make_redactor(config.redaction_mode, key, config.field_rules_file)
     if config.field_rules_file:
         # Rule count only: a log line must never echo customer schema details
         # that could be sensitive themselves.
-        logger.info("loaded %d field rules from %s", len(rules), config.field_rules_file)
-    return StructuredRedactor(
-        Redactor(
-            policy=policy,
-            # Compiled Rust core when installed, pure Python otherwise;
-            # output is byte-identical either way.
-            backend="auto",
-            # Third-party detector plugins run with full process privileges
-            # inside a service that sees every record: opt-in only.
-            load_plugins=False,
-        ),
-        rules,
-    )
+        logger.info("loaded %d field rules from %s", redactor.rule_count, config.field_rules_file)
+    return redactor
 
 
 def main() -> int:

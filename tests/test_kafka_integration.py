@@ -297,3 +297,22 @@ def test_container_image_under_kubernetes_restrictions(
             assert leaked not in logs.stdout + logs.stderr
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+
+
+@pytest.mark.skipif(not IMAGE, reason="SAFESTREAM_IT_IMAGE not set")
+def test_container_batch_job_over_a_pipe() -> None:
+    """``safestream-batch`` inside the distroless image, as the README runs it."""
+    cmd = ["docker", "run", "-i", "--rm", "--read-only", "--cap-drop", "ALL"]
+    cmd += ["--security-opt", "no-new-privileges", "--user", "65532:65532", "--network", "none"]
+    cmd += ["--entrypoint", "/usr/bin/python3", IMAGE, "-m", "safestream_enterprise.batch", "-"]
+    record = b'{"LastName":"Smith","msg":"mail bob@corp.example"}\n'
+    proc = subprocess.run(
+        cmd,
+        input=record + b"<u><Phone>555 0100</Phone></u>\n",
+        capture_output=True,
+        check=True,
+    )
+    assert proc.stdout == (
+        b'{"LastName":"[REDACTED]","msg":"mail [REDACTED]"}\n<u><Phone>[REDACTED]</Phone></u>\n'
+    )
+    assert b"Smith" not in proc.stderr

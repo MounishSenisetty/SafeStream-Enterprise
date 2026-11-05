@@ -134,7 +134,35 @@ Point your data-lake sinks at `egress-logs-clean`. Producers do not need any cha
 docker run --rm -e KAFKA_BOOTSTRAP_SERVERS=broker:9092 safestream-enterprise
 ```
 
-**Python library** (batch jobs, Spark UDFs, custom services):
+**Backfill the data lake** with `safestream-batch`. It redacts NDJSON, or one XML record
+per line, from files, directory trees or stdin in constant memory. It uses the same rules,
+mode and HMAC key as the connector, so backfilled records get the same pseudonyms as
+streamed ones and stay joinable:
+
+```bash
+safestream-batch lake/raw/ -o lake/clean/ --rules field-rules.json --report report.json
+```
+
+```bash
+aws s3 cp s3://lake/raw/app.ndjson.gz - | gunzip | safestream-batch - | gzip | aws s3 cp - s3://lake/clean/app.ndjson.gz
+```
+
+- **Inputs and outputs.** Directory trees are mirrored into the output directory, including
+  `*.ndjson`, `*.jsonl`, `*.json`, `*.log` and `*.xml`, plain or `.gz`. Change the selection
+  with `--include`.
+- **Object storage.** `-` reads stdin and writes stdout, so any CLI that streams objects works
+  without an SDK.
+- **Safe writes.** Each output is written to a temporary file, fsynced, then renamed into place,
+  so a crash never leaves a half-redacted file. Outputs are created mode 0600, and line endings
+  and blank lines are kept.
+- **Content-free report.** `--report` writes counts by entity type, lines processed, how many
+  lines fell back to text redaction, and the rule fingerprint.
+- **Secrets.** `SAFESTREAM_HMAC_KEY` comes from the environment, never from an argument, which
+  other users could see in the process list.
+- **In the container image:**
+  `docker run -i --entrypoint /usr/bin/python3 ghcr.io/mounishsenisetty/safestream-enterprise:0.2.0 -m safestream_enterprise.batch -`.
+
+**Python library** (Spark UDFs, custom services):
 
 ```python
 from safestream_enterprise import StructuredRedactor
@@ -311,11 +339,14 @@ SafeStream-Enterprise/
 │   └── kubernetes/
 │       └── kafka-redactor.yaml         # Deployment + default-deny NetworkPolicy
 ├── src/safestream_enterprise/
+│   ├── batch.py                        # safestream-batch: backfill files / stdin
+│   ├── rules.py                        # custom field rules + the shared redactor factory
 │   ├── parsers/
 │   │   ├── json_ast.py                 # structure-aware JSON/NDJSON redaction (entry point)
 │   │   └── xml_ast.py                  # structure-aware XML redaction, same field rules
 │   └── connectors/
-│       └── kafka.py                    # ingress -> redact -> egress consumer group
+│       ├── kafka.py                    # ingress -> redact -> egress consumer group
+│       └── health.py                   # /healthz, /readyz, /metrics
 └── tests/
 ```
 

@@ -37,9 +37,9 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
-from safestream_redactor import EntityType
+from safestream_redactor import EntityType, RedactionMode, RedactionPolicy, Redactor
 
-from safestream_enterprise.parsers.json_ast import DEFAULT_FIELD_RULES
+from safestream_enterprise.parsers.json_ast import DEFAULT_FIELD_RULES, StructuredRedactor
 
 
 class FieldRulesError(ValueError):
@@ -115,3 +115,31 @@ def load_field_rules(path: str | Path) -> dict[str, EntityType]:
     if not isinstance(data, dict):
         raise FieldRulesError(f"field rules file {path} must contain a JSON object")
     return parse_field_rules(data)
+
+
+def make_redactor(
+    mode: RedactionMode,
+    hmac_key: bytes | None = None,
+    field_rules_file: str | Path | None = None,
+) -> StructuredRedactor:
+    """The redactor every SafeStream Enterprise entry point uses.
+
+    The Kafka connector and the batch job both build through here, so the same
+    ``hmac_key`` and rules give byte-identical output: a record backfilled
+    from the lake and the same record streamed through Kafka get the same
+    pseudonyms, and stay joinable. Raises ``ValueError`` on a bad rules file
+    or an invalid mode/key combination.
+    """
+    rules = load_field_rules(field_rules_file) if field_rules_file else DEFAULT_FIELD_RULES
+    return StructuredRedactor(
+        Redactor(
+            policy=RedactionPolicy(mode=mode, hmac_key=hmac_key),
+            # Compiled Rust core when installed, pure Python otherwise;
+            # output is byte-identical either way.
+            backend="auto",
+            # Third-party detector plugins run with full process privileges
+            # inside a process that sees every record: opt-in only.
+            load_plugins=False,
+        ),
+        rules,
+    )
