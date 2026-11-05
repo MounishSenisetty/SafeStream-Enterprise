@@ -161,6 +161,7 @@ with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
 | `SAFESTREAM_HMAC_KEY` | none | Key for consistent pseudonyms (mount from a Secret) |
 | `SAFESTREAM_UNPARSEABLE` | `dlq` | Payloads that are neither JSON nor XML. `dlq`: send them to the DLQ. `redact_text`: text-redact them and deliver them to egress |
 | `SAFESTREAM_DELIVERY` | `at_least_once` | `at_least_once` or `exactly_once` (one transaction per batch; needs transactional-ID write permission on the brokers) |
+| `SAFESTREAM_FIELD_RULES_FILE` | none | JSON file of customer field rules, usually a mounted ConfigMap. See [Custom field rules](#custom-field-rules) |
 | `SAFESTREAM_TRANSACTIONAL_ID` | `<group id>-<hostname>` | Exactly-once only. The default (the pod name on Kubernetes) is unique per instance, which is all exactly-once needs |
 | `SAFESTREAM_BATCH_SIZE` | `500` | Records per commit (per transaction in exactly-once mode) |
 | `SAFESTREAM_FLUSH_TIMEOUT_S` | `30` | Maximum wait for egress acknowledgements per batch |
@@ -170,19 +171,43 @@ Configuration is validated at startup. A bad value, or a dangerous combination s
 DLQ topic set to the clean topic, stops the pod immediately with a clear error. Secret values
 never appear in logs.
 
-Custom field rules, for proprietary schemas. A glob matches the key in any spelling style.
-A pattern prefixed with `re:` is a case-insensitive regular expression matched against the
-key as written:
+### Custom field rules
+
+The built-in rules cover common PCI, HIPAA and GDPR field names. To add your own schema's
+fields, such as `loyalty_number` or a vendor signature header, supply a JSON rules file. No
+code change or rebuild is needed. On Kubernetes it's the `safestream-field-rules` ConfigMap in
+the manifest, mounted read-only and named by `SAFESTREAM_FIELD_RULES_FILE`:
+
+```json
+{
+  "mode": "extend",
+  "rules": {
+    "*loyalty_number*": "id_number",
+    "re:^x-acme-.*-signature$": "secret"
+  },
+  "disable": ["*login*"]
+}
+```
+
+- **Patterns.** A glob matches the field name in any spelling style: `*loyalty_number*` matches
+  `loyaltyNumber`, `LOYALTY-NUMBER` and `loyalty_number_hash`. A pattern prefixed with `re:` is
+  a case-insensitive regular expression matched against the name as written. In XML, element
+  names, attribute names and `Name`/`key` attributes all count as field names.
+- **`mode: "extend"`** (the default) puts your rules ahead of the built-in ones, so yours win
+  where both match. `disable` removes built-in rules by their exact pattern, for a field that
+  isn't sensitive in your schema.
+- **`mode: "replace"`** uses only your rules.
+- **Validated at startup.** An unknown entity type, a misspelled key, an invalid regex, or a
+  `disable` entry that matches no built-in rule stops the pod with a clear error rather than
+  leaving a field unredacted. The file is read once, so after editing the ConfigMap, roll the
+  pods (`kubectl rollout restart`) so every replica uses the same rules.
+
+The same rules work from Python:
 
 ```python
-from safestream_enterprise import DEFAULT_FIELD_RULES, StructuredRedactor
+from safestream_enterprise import StructuredRedactor, load_field_rules
 
-rules = {
-    "*loyalty_number*": "id_number",  # loyaltyNumber, LOYALTY-NUMBER, ...
-    "re:^x-.*-signature$": "secret",  # X-Amz-Signature, x-goog-signature
-    **DEFAULT_FIELD_RULES,
-}
-redactor = StructuredRedactor(field_rules=rules)
+redactor = StructuredRedactor(field_rules=load_field_rules("field-rules.json"))
 ```
 
 ## Security model
