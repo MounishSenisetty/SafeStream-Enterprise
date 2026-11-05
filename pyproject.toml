@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "mypy>=1.8", "ruff>=0.15,<0.16"]
+dev = ["pytest>=7", "mypy>=1.8", "ruff>=0.15,<0.18"]
 
 [project.scripts]
 safestream-kafka = "safestream_enterprise.connectors.kafka:main"
