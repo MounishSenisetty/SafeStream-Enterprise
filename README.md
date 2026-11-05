@@ -147,9 +147,13 @@ safestream-batch lake/raw/ -o lake/clean/ --rules field-rules.json --report repo
 aws s3 cp s3://lake/raw/app.ndjson.gz - | gunzip | safestream-batch - | gzip | aws s3 cp - s3://lake/clean/app.ndjson.gz
 ```
 
-- **Inputs and outputs.** Directory trees are mirrored into the output directory, including
-  `*.ndjson`, `*.jsonl`, `*.json`, `*.log` and `*.xml`, plain or `.gz`. Change the selection
-  with `--include`.
+- **One record per line.** Directory trees are mirrored into the output directory, including
+  `*.ndjson`, `*.jsonl` and `*.log`, plain or `.gz`; change the selection with `--include`.
+  Each line must be a whole JSON or XML record. A pretty-printed, multi-line `.json` or `.xml`
+  document has no line that parses on its own, so it gets only text redaction and the field
+  rules don't apply. The run logs a warning when that happens, and the report counts it as
+  `text_fallback_lines`. Flatten such files first, for example with `jq -c .`.
+- **No silent overwrites.** Two inputs that would write the same output path are refused.
 - **Object storage.** `-` reads stdin and writes stdout, so any CLI that streams objects works
   without an SDK.
 - **Safe writes.** Each output is written to a temporary file, fsynced, then renamed into place,

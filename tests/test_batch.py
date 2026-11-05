@@ -164,3 +164,37 @@ def test_memory_does_not_grow_with_input_size() -> None:
     small, large = _peak_bytes(1_000), _peak_bytes(10_000)
     # 10x the records, same peak: memory is bounded by the longest line
     assert large < small * 1.5 + 64 * 1024, (small, large)
+
+
+# --- pre-release review regressions ------------------------------------------
+
+
+def test_multiline_json_is_not_picked_up_by_default_and_warns_if_forced(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    pretty = b'{\n  "user": {\n    "password": "hunter2"\n  }\n}\n'
+    (raw / "users.json").write_bytes(pretty)
+    (raw / "page.xml").write_bytes(b"<user>\n  <password>hunter2</password>\n</user>\n")
+    out = tmp_path / "clean"
+    assert main([str(raw), "-o", str(out)]) == 0
+    assert not out.exists() or list(out.rglob("*")) == []  # neither default-included
+    # explicitly included: still runs, but says loudly that field rules didn't apply
+    assert main([str(raw), "-o", str(out), "--include", "*.json"]) == 0
+    assert "text redaction only" in caplog.text and "field rules did not apply" in caplog.text
+
+
+def test_colliding_destinations_are_refused(tmp_path: Path) -> None:
+    for day in ("day1", "day2"):
+        (tmp_path / day).mkdir()
+        (tmp_path / day / "app.ndjson").write_bytes(b'{"day":"' + day.encode() + b'"}\n')
+    out = tmp_path / "clean"
+    assert (
+        main(
+            [str(tmp_path / "day1/app.ndjson"), str(tmp_path / "day2/app.ndjson"), "-o", f"{out}/"]
+        )
+        == 2
+    )
+    assert main([str(tmp_path / "day1"), str(tmp_path / "day2"), "-o", str(out)]) == 2
+    assert not out.exists()  # refused before anything was written

@@ -128,7 +128,8 @@ def test_redacts_value_key_headers_and_commits_after_ack() -> None:
     # /metrics view: counts only
     m = conn.snapshot()
     assert (m.egress_records, m.dlq_records, m.batches, m.transaction_aborts) == (2, 0, 1, 0)
-    assert m.redactions == {"email": 1}
+    # value + key + header: key and header redactions count too (compliance evidence)
+    assert m.redactions == {"email": 3}
 
 
 def test_delivery_failure_never_commits() -> None:
@@ -388,3 +389,70 @@ def test_eos_config() -> None:
     assert pinned.producer_config()["transactional.id"] == "redactor-0"
     with pytest.raises(ValidationError):  # an id without the mode is a misconfiguration
         ConnectorConfig(bootstrap_servers="b", transactional_id="redactor-0")
+
+
+# --- pre-release review regressions ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key",
+    [b"1e3", b"1.50", b" 42", b'{"id": 7}', b"123456789012345678901234", b"user-42", "str-key"],
+)
+def test_keys_and_headers_without_findings_pass_through_byte_for_byte(key: bytes | str) -> None:
+    # re-serialising them would move records to other partitions / corrupt IDs
+    p = FakeProducer()
+    conn, _ = make(p)
+    conn.process_batch([FakeMsg(b'{"a":1}', key=key, headers=[("trace", key)])])  # type: ignore[arg-type, list-item]
+    (sent,) = p.sent
+    assert sent["key"] == key
+    assert sent["headers"][0] == ("trace", key)
+
+
+def test_protected_kafka_properties_cannot_be_overridden() -> None:
+    for name in ("ENABLE_AUTO_COMMIT", "ACKS", "ISOLATION_LEVEL", "ENABLE_IDEMPOTENCE"):
+        with pytest.raises(ValidationError, match="may not set"):
+            ConnectorConfig.from_env(
+                {"KAFKA_BOOTSTRAP_SERVERS": "b:9092", f"SAFESTREAM_KAFKA_{name}": "x"}
+            )
+    # ordinary client settings (auth, TLS) are still allowed
+    ConnectorConfig.from_env(
+        {"KAFKA_BOOTSTRAP_SERVERS": "b:9092", "SAFESTREAM_KAFKA_SSL_CA_LOCATION": "/ca.pem"}
+    )
+
+
+def test_commit_retries_keep_the_heartbeat_fresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    from safestream_enterprise.connectors import kafka
+
+    clock = iter(range(1000, 2000))
+    monkeypatch.setattr(kafka.time, "monotonic", lambda: next(clock))
+    retriable = KafkaError(KafkaError._TIMED_OUT, "slow", retriable=True)
+    p = TxnProducer(commit_errors=[retriable, retriable, retriable])
+    beats: list[float] = []
+    original = p.commit_transaction
+
+    def commit(timeout: float) -> None:
+        beats.append(conn.heartbeat)
+        original(timeout)
+
+    p.commit_transaction = commit  # type: ignore[method-assign]
+    conn = make_eos(p)
+    conn.process_batch(BATCH)  # type: ignore[arg-type]
+    assert len(beats) == 4 and beats == sorted(set(beats))  # refreshed before every attempt
+
+
+def test_audit_never_reports_an_uncommitted_batch() -> None:
+    p = FakeProducer(fail=True)
+    conn = KafkaRedactionConnector(
+        ConnectorConfig(bootstrap_servers="x", audit_topic="audit"),
+        StructuredRedactor(),
+        FakeConsumer(),  # type: ignore[arg-type]
+        p,  # type: ignore[arg-type]
+    )
+    with pytest.raises(DeliveryError):
+        conn.process_batch([FakeMsg(b'{"email": "a@b.example"}')])  # type: ignore[list-item]
+    p.fail = False
+    conn._maybe_audit(final=True)  # what run()'s finally does on the way out
+    (audit,) = [json.loads(m["value"]) for m in p.sent if m["topic"] == "audit"]
+    # the batch will be replayed after restart and counted then, exactly once
+    assert audit["records"] == {"egress": 0, "dlq": 0} and audit["redactions"] == {}
+    assert conn.snapshot().egress_records == 1  # live metrics still show the attempt

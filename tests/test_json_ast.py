@@ -102,3 +102,14 @@ def test_policy_and_custom_rules_and_stats() -> None:
 def test_ndjson_stream() -> None:
     lines = ['{"email": "a"}\n', "\n", "plain bob@corp.example\n"]
     assert list(R.redact_lines(lines)) == ['{"email":"[REDACTED]"}', "", "plain [REDACTED]"]
+
+
+def test_long_keys_are_classified_but_never_cached() -> None:
+    # hostile records must not be able to fill the key cache with huge keys
+    r = StructuredRedactor()
+    long_key = "x" * 10_000 + "password"
+    assert r.classify_key(long_key) is not None  # still redacted as a password field
+    assert r._classify_cached.cache_info().currsize == 0
+    out = json.loads(r.redact_line(json.dumps({long_key: "hunter2", "email": "e"})).text)
+    assert out[long_key] == "[REDACTED]" and out["email"] == "[REDACTED]"
+    assert r._classify_cached.cache_info().currsize == 1  # only the short key

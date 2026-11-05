@@ -97,6 +97,22 @@ MODE_HEADER = "x-safestream-redaction"
 ERROR_HEADER = "x-safestream-error"
 #: exactly_once: transaction attempts per batch before giving up (and restarting).
 MAX_TRANSACTION_ATTEMPTS = 5
+#: librdkafka properties the delivery guarantees depend on; SAFESTREAM_KAFKA_*
+#: may not override them (a stray ENABLE_AUTO_COMMIT=true would silently commit
+#: offsets before egress is acknowledged).
+PROTECTED_CLIENT_PROPERTIES = frozenset(
+    {
+        "bootstrap.servers",
+        "group.id",
+        "enable.auto.commit",
+        "enable.auto.offset.store",
+        "auto.offset.reset",
+        "isolation.level",
+        "enable.idempotence",
+        "acks",
+        "transactional.id",
+    }
+)
 #: Schema identifier carried by every audit event; bump on incompatible change.
 AUDIT_SCHEMA = "safestream.audit/v1"
 
@@ -165,6 +181,13 @@ class ConnectorConfig(BaseModel):
             raise ValueError("ingress, egress, DLQ and audit topics must all be different")
         if self.redaction_mode is RedactionMode.PSEUDONYMIZE and not self.hmac_key:
             raise ValueError("pseudonymize mode requires SAFESTREAM_HMAC_KEY")
+        protected = sorted(PROTECTED_CLIENT_PROPERTIES & set(self.client_overrides))
+        if protected:
+            # Names only: the values may be secrets.
+            raise ValueError(
+                f"SAFESTREAM_KAFKA_* may not set {protected}: the delivery guarantees "
+                "depend on them; use the dedicated SAFESTREAM_*/KAFKA_* settings instead"
+            )
         if self.transactional_id and self.delivery != "exactly_once":
             raise ValueError(
                 "SAFESTREAM_TRANSACTIONAL_ID requires SAFESTREAM_DELIVERY=exactly_once"
@@ -286,7 +309,11 @@ class KafkaRedactionConnector:
         # taken when the previous audit event was *acknowledged*, so a failed
         # send is carried into the next window instead of being lost.
         self.instance = socket.gethostname()  # the pod name on Kubernetes
-        self._audit_base = self.snapshot()
+        # Counters as of the last *committed* batch. Audits report from this, so
+        # records of a batch that failed (and will be replayed after a restart)
+        # are never reported, and replays are never counted twice.
+        self._committed = self.snapshot()
+        self._audit_base = self._committed
         self._audit_window_start = datetime.now(timezone.utc)
         self._audit_due = time.monotonic() + config.audit_interval_s
 
@@ -416,7 +443,7 @@ class KafkaRedactionConnector:
         if not final and now < self._audit_due:
             return
         self._audit_due = now + self.config.audit_interval_s
-        current = self.snapshot()
+        current = self._committed
         end = datetime.now(timezone.utc)
         event = self.audit_event(self._audit_base, current, self._audit_window_start, end, final)
         if self._publish_audit(orjson.dumps(event)):
@@ -502,9 +529,21 @@ class KafkaRedactionConnector:
                 # librdkafka's queue is full: serve delivery reports to drain it.
                 self.producer.poll(1.0)
 
-    def _redact_bytes(self, data: str | bytes) -> bytes:
-        """Redact a key or header value (plain text or JSON, never strict)."""
-        return self.redactor.redact_line(data).data
+    def _redact_bytes(self, data: str | bytes) -> str | bytes:
+        """Redact a key or header value; return it *unchanged* if nothing was found.
+
+        Re-serialising would rewrite values with nothing sensitive in them
+        (``1e3`` -> ``1000.0``, ``{"id": 7}`` -> ``{"id":7}``, large numeric IDs
+        losing precision), which would move records to other partitions and
+        corrupt business keys. Redactions that do happen are counted, so they
+        appear in metrics and audit events.
+        """
+        found = RedactionStats()
+        redacted = self.redactor.redact_line(data, found).data
+        if not found.total:
+            return data
+        self.stats.counts.update(found.counts)
+        return redacted
 
     def handle_message(self, msg: Message) -> None:
         """Redact one record and hand it to the producer (not yet acknowledged)."""
@@ -613,6 +652,7 @@ class KafkaRedactionConnector:
         # Synchronous: when this returns, a restart resumes after this batch.
         self.consumer.commit(asynchronous=False)
         self.batches += 1
+        self._committed = self.snapshot()
 
     def _process_transactional(self, messages: list[Message]) -> None:
         """Publish ``messages`` and commit their offsets in one transaction.
@@ -649,6 +689,7 @@ class KafkaRedactionConnector:
                 continue
             self._delivery_errors.clear()
             self.batches += 1
+            self._committed = self.snapshot()
             return
         raise DeliveryError(
             f"transaction aborted {MAX_TRANSACTION_ATTEMPTS} times; offsets NOT committed, "
@@ -658,6 +699,9 @@ class KafkaRedactionConnector:
     def _commit_transaction(self) -> None:
         """Commit, retrying errors librdkafka marks retriable (e.g. a timeout)."""
         for attempt in range(1, MAX_TRANSACTION_ATTEMPTS + 1):
+            # Each attempt can wait a full flush timeout; a retry is progress,
+            # so keep liveness fresh rather than let kubelet kill a recovering pod.
+            self.heartbeat = time.monotonic()
             try:
                 self.producer.commit_transaction(self.config.flush_timeout_s)
                 return
