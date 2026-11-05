@@ -63,6 +63,7 @@ import signal
 import socket
 import sys
 from collections.abc import Mapping
+from pathlib import Path
 from types import FrameType
 from typing import Literal
 
@@ -78,7 +79,8 @@ from confluent_kafka import (
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from safestream_redactor import RedactionMode, RedactionPolicy, RedactionStats, Redactor
 
-from safestream_enterprise.parsers.json_ast import StructuredRedactor
+from safestream_enterprise.parsers.json_ast import DEFAULT_FIELD_RULES, StructuredRedactor
+from safestream_enterprise.rules import load_field_rules
 
 logger = logging.getLogger("safestream_enterprise.kafka")
 
@@ -129,6 +131,9 @@ class ConnectorConfig(BaseModel):
     delivery: Literal["at_least_once", "exactly_once"] = "at_least_once"
     #: exactly_once only. Defaults to ``<group_id>-<hostname>``.
     transactional_id: str | None = Field(default=None, min_length=1)
+    #: JSON file of customer field rules (see :mod:`safestream_enterprise.rules`),
+    #: typically a mounted ConfigMap. ``None`` uses the built-in rules only.
+    field_rules_file: Path | None = None
     #: Extra librdkafka properties applied to both consumer and producer
     #: (security.protocol, sasl.*, ssl.* ...). Secret-wrapped: may hold passwords.
     client_overrides: dict[str, SecretStr] = Field(default_factory=dict)
@@ -174,6 +179,7 @@ class ConnectorConfig(BaseModel):
             "SAFESTREAM_UNPARSEABLE": "unparseable",
             "SAFESTREAM_DELIVERY": "delivery",
             "SAFESTREAM_TRANSACTIONAL_ID": "transactional_id",
+            "SAFESTREAM_FIELD_RULES_FILE": "field_rules_file",
         }
         data: dict[str, object] = {field: env[var] for var, field in names.items() if env.get(var)}
         data["client_overrides"] = {
@@ -488,9 +494,22 @@ def build_redactor(config: ConnectorConfig) -> StructuredRedactor:
     ``hmac_key`` keys pseudonymize mode so the same customer maps to the same
     token across every topic and day. Mount it from a Secret; never bake it
     into the image.
+
+    ``field_rules_file`` adds customer field rules. It is read once, here: a
+    changed ConfigMap takes effect on the next rollout, so every replica runs
+    the same rules. Raises ``ValueError`` (``FieldRulesError``) on a bad file.
     """
     key = config.hmac_key.get_secret_value().encode() if config.hmac_key else None
     policy = RedactionPolicy(mode=config.redaction_mode, hmac_key=key)
+    rules = (
+        load_field_rules(config.field_rules_file)
+        if config.field_rules_file
+        else DEFAULT_FIELD_RULES
+    )
+    if config.field_rules_file:
+        # Rule count only: a log line must never echo customer schema details
+        # that could be sensitive themselves.
+        logger.info("loaded %d field rules from %s", len(rules), config.field_rules_file)
     return StructuredRedactor(
         Redactor(
             policy=policy,
@@ -500,7 +519,8 @@ def build_redactor(config: ConnectorConfig) -> StructuredRedactor:
             # Third-party detector plugins run with full process privileges
             # inside a service that sees every record: opt-in only.
             load_plugins=False,
-        )
+        ),
+        rules,
     )
 
 

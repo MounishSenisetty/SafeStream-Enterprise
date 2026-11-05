@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from confluent_kafka import Consumer, Message, Producer, TopicPartition
@@ -185,9 +186,15 @@ def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str], deli
 
 
 @pytest.mark.skipif(not IMAGE, reason="SAFESTREAM_IT_IMAGE not set")
-def test_container_image_under_kubernetes_restrictions(topics: dict[str, str]) -> None:
-    """The distroless image, read-only, all capabilities dropped, non-root."""
+def test_container_image_under_kubernetes_restrictions(
+    topics: dict[str, str], tmp_path: Path
+) -> None:
+    """The distroless image, read-only, all capabilities dropped, non-root,
+    with customer field rules mounted read-only as a ConfigMap would be."""
     name = f"it-{uuid.uuid4().hex[:8]}"
+    rules = tmp_path / "field-rules.json"
+    rules.write_text(json.dumps({"rules": {"*loyalty_number*": "id_number"}}), encoding="utf-8")
+    rules.chmod(0o644)  # readable by the image's non-root user
     env = {
         "KAFKA_BOOTSTRAP_SERVERS": BOOTSTRAP,
         "KAFKA_GROUP_ID": name,
@@ -198,18 +205,23 @@ def test_container_image_under_kubernetes_restrictions(topics: dict[str, str]) -
         "SAFESTREAM_HMAC_KEY": "ci-only-key-" + "x" * 32,
         # transactional.id derived from the container hostname, as on Kubernetes
         "SAFESTREAM_DELIVERY": "exactly_once",
+        "SAFESTREAM_FIELD_RULES_FILE": "/etc/safestream/field-rules.json",
     }
     run = ["docker", "run", "-d", "--name", name, "--network", "host", "--read-only"]
     run += ["--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--user", "65532:65532"]
+    run += ["-v", f"{rules}:/etc/safestream/field-rules.json:ro"]
     for k, v in env.items():
         run += ["-e", f"{k}={v}"]
     subprocess.run([*run, IMAGE], check=True, capture_output=True)
     try:
-        produce(topics["ingress"], [(None, json.dumps(PII_RECORD).encode())])
+        record = {**PII_RECORD, "loyaltyNumber": "L-4242-77"}
+        produce(topics["ingress"], [(None, json.dumps(record).encode())])
         egress = drain(topics["egress"], 1, timeout_s=90)
         assert len(egress) == 1
         out = json.loads(egress[0].value())
         assert out["LastName"].startswith("<PERSON_") and out["password"].startswith("<SECRET_")
+        # the mounted customer rule applied; it is not a built-in rule
+        assert out["loyaltyNumber"].startswith("<ID_NUMBER_")
         assert "Smith" not in egress[0].value().decode()
 
         # SIGTERM (what Kubernetes sends) drains and exits 0.
@@ -223,7 +235,13 @@ def test_container_image_under_kubernetes_restrictions(topics: dict[str, str]) -
         logs = subprocess.run(["docker", "logs", name], capture_output=True, text=True)
         assert code == "0", logs.stdout + logs.stderr
         # Operational logs never carry record content or secrets.
-        for leaked in ("Smith", "hunter2", "bob@corp.example", env["SAFESTREAM_HMAC_KEY"]):
+        for leaked in (
+            "Smith",
+            "hunter2",
+            "bob@corp.example",
+            "L-4242-77",
+            env["SAFESTREAM_HMAC_KEY"],
+        ):
             assert leaked not in logs.stdout + logs.stderr
     finally:
         subprocess.run(["docker", "rm", "-f", name], capture_output=True)

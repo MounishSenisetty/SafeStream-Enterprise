@@ -14,6 +14,29 @@
 # Assumes the brokers run in namespace "kafka" with pod label
 # app.kubernetes.io/name=kafka, listening on 9092. Adjust the NetworkPolicy
 # selectors to match your cluster (e.g. strimzi.io/cluster for Strimzi).
+---
+# Customer field rules, added to the built-in PCI/HIPAA/GDPR rules (see
+# "Custom field rules" in the README for the format). They are read once at
+# startup and validated: a bad file stops the pod with a clear error instead of
+# leaving a field unredacted. After editing, roll the pods so every replica
+# uses the same rules:
+#   kubectl -n safestream rollout restart deployment/safestream-kafka-redactor
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: safestream-field-rules
+  namespace: safestream
+data:
+  field-rules.json: |
+    {
+      "mode": "extend",
+      "rules": {
+        "*loyalty_number*": "id_number",
+        "*member_id*": "id_number"
+      },
+      "disable": []
+    }
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -66,6 +89,8 @@ spec:
             # and clean-topic consumers must read with isolation.level=read_committed.
             - name: SAFESTREAM_DELIVERY
               value: "at_least_once"
+            - name: SAFESTREAM_FIELD_RULES_FILE
+              value: "/etc/safestream/field-rules.json"
             - name: SAFESTREAM_MODE
               value: "pseudonymize"
             - name: SAFESTREAM_HMAC_KEY
@@ -94,6 +119,14 @@ spec:
             privileged: false
             capabilities:
               drop: ["ALL"]
+          volumeMounts:
+            - name: field-rules
+              mountPath: /etc/safestream
+              readOnly: true
+      volumes:
+        - name: field-rules
+          configMap:
+            name: safestream-field-rules
 ---
 # Default-deny for the connector pods. Selecting a pod with both policy types
 # denies all ingress and all egress not explicitly allowed below, so the only
