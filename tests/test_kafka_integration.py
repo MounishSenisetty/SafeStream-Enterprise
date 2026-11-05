@@ -23,6 +23,7 @@ import pytest
 from confluent_kafka import Consumer, Message, Producer, TopicPartition
 from confluent_kafka.admin import AdminClient, NewTopic
 
+from safestream_enterprise import DEFAULT_FIELD_RULES
 from safestream_enterprise.connectors.kafka import (
     ConnectorConfig,
     KafkaRedactionConnector,
@@ -40,7 +41,7 @@ PII_RECORD = {"LastName": "Smith", "password": "hunter2", "msg": "mail bob@corp.
 def topics() -> Iterator[dict[str, str]]:
     """Fresh single-partition topics per test, so runs never see each other's data."""
     suffix = uuid.uuid4().hex[:8]
-    names = {k: f"it-{k}-{suffix}" for k in ("ingress", "egress", "dlq")}
+    names = {k: f"it-{k}-{suffix}" for k in ("ingress", "egress", "dlq", "audit")}
     admin = AdminClient({"bootstrap.servers": BOOTSTRAP})
     new = [NewTopic(t, num_partitions=1, replication_factor=1) for t in names.values()]
     for future in admin.create_topics(new).values():
@@ -149,6 +150,7 @@ def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str], deli
         ingress_topic=topics["ingress"],
         egress_topic=topics["egress"],
         dlq_topic=topics["dlq"],
+        audit_topic=topics["audit"],
         poll_timeout_s=0.5,
         delivery=delivery,  # type: ignore[arg-type]
     )
@@ -207,6 +209,15 @@ def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str], deli
     assert json.loads(egress[3].value()) == {"email": "[REDACTED]"}
     assert committed_lag(group, topics["ingress"]) == 0
 
+    # Compliance audit: each run closed its window on shutdown, and the events
+    # account for exactly what was processed (3 + 1 egress, 1 DLQ), no more.
+    events = [json.loads(m.value()) for m in drain(topics["audit"], 2)]
+    assert len(events) == 2 and all(e["window"]["final"] for e in events)
+    assert all(e["schema"] == "safestream.audit/v1" and e["delivery"] == delivery for e in events)
+    assert sum(e["records"]["egress"] for e in events) == 4
+    assert sum(e["records"]["dlq"] for e in events) == 1
+    assert sum(e["redactions"].get("email", 0) for e in events) >= 1
+
 
 @pytest.mark.skipif(not IMAGE, reason="SAFESTREAM_IT_IMAGE not set")
 def test_container_image_under_kubernetes_restrictions(
@@ -225,6 +236,7 @@ def test_container_image_under_kubernetes_restrictions(
         "INGRESS_TOPIC": topics["ingress"],
         "EGRESS_TOPIC": topics["egress"],
         "DLQ_TOPIC": topics["dlq"],
+        "SAFESTREAM_AUDIT_TOPIC": topics["audit"],
         "SAFESTREAM_MODE": "pseudonymize",
         "SAFESTREAM_HMAC_KEY": "ci-only-key-" + "x" * 32,
         # transactional.id derived from the container hostname, as on Kubernetes
@@ -268,6 +280,12 @@ def test_container_image_under_kubernetes_restrictions(
         ).stdout.strip()
         logs = subprocess.run(["docker", "logs", name], capture_output=True, text=True)
         assert code == "0", logs.stdout + logs.stderr
+        # The SIGTERM drain closed the audit window: one event, content-free.
+        (audit,) = [json.loads(m.value()) for m in drain(topics["audit"], 1)]
+        assert audit["window"]["final"] and audit["records"] == {"egress": 1, "dlq": 0}
+        assert audit["redactions"]["id_number"] == 1  # the mounted custom rule
+        assert audit["field_rules"]["count"] == len(DEFAULT_FIELD_RULES) + 1  # + 1 custom
+        assert "L-4242-77" not in json.dumps(audit) and "Smith" not in json.dumps(audit)
         # Operational logs never carry record content or secrets.
         for leaked in (
             "Smith",

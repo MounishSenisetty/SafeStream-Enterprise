@@ -64,10 +64,12 @@ import socket
 import sys
 import time
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
 from typing import Literal
 
+import orjson
 from confluent_kafka import (
     TIMESTAMP_NOT_AVAILABLE,
     Consumer,
@@ -80,6 +82,7 @@ from confluent_kafka import (
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from safestream_redactor import RedactionMode, RedactionPolicy, RedactionStats, Redactor
 
+from safestream_enterprise import __version__
 from safestream_enterprise.connectors.health import ConnectorMetrics, HealthServer
 from safestream_enterprise.parsers.json_ast import DEFAULT_FIELD_RULES, StructuredRedactor
 from safestream_enterprise.rules import load_field_rules
@@ -94,6 +97,8 @@ MODE_HEADER = "x-safestream-redaction"
 ERROR_HEADER = "x-safestream-error"
 #: exactly_once: transaction attempts per batch before giving up (and restarting).
 MAX_TRANSACTION_ATTEMPTS = 5
+#: Schema identifier carried by every audit event; bump on incompatible change.
+AUDIT_SCHEMA = "safestream.audit/v1"
 
 
 class DeliveryError(RuntimeError):
@@ -140,6 +145,11 @@ class ConnectorConfig(BaseModel):
     metrics_port: int = Field(default=9400, ge=0, le=65535)
     #: /healthz fails once the main loop has not advanced for this long.
     liveness_timeout_s: float = Field(default=120.0, gt=0)
+    #: Topic for compliance audit events (see :meth:`KafkaRedactionConnector.audit_event`);
+    #: ``None`` disables auditing.
+    audit_topic: str | None = Field(default=None, min_length=1)
+    #: Seconds per audit window.
+    audit_interval_s: float = Field(default=60.0, ge=1)
     #: Extra librdkafka properties applied to both consumer and producer
     #: (security.protocol, sasl.*, ssl.* ...). Secret-wrapped: may hold passwords.
     client_overrides: dict[str, SecretStr] = Field(default_factory=dict)
@@ -149,9 +159,10 @@ class ConnectorConfig(BaseModel):
         # A topic collision is a data-safety bug, not a style issue: egress ==
         # ingress loops forever, and dlq == egress publishes raw records to the
         # clean topic.
-        topics = (self.ingress_topic, self.egress_topic, self.dlq_topic)
+        topics: tuple[str, ...] = (self.ingress_topic, self.egress_topic, self.dlq_topic)
+        topics += (self.audit_topic,) if self.audit_topic else ()
         if len(set(topics)) != len(topics):
-            raise ValueError("ingress, egress and DLQ topics must all be different")
+            raise ValueError("ingress, egress, DLQ and audit topics must all be different")
         if self.redaction_mode is RedactionMode.PSEUDONYMIZE and not self.hmac_key:
             raise ValueError("pseudonymize mode requires SAFESTREAM_HMAC_KEY")
         if self.transactional_id and self.delivery != "exactly_once":
@@ -194,6 +205,8 @@ class ConnectorConfig(BaseModel):
             "SAFESTREAM_FIELD_RULES_FILE": "field_rules_file",
             "SAFESTREAM_METRICS_PORT": "metrics_port",
             "SAFESTREAM_LIVENESS_TIMEOUT_S": "liveness_timeout_s",
+            "SAFESTREAM_AUDIT_TOPIC": "audit_topic",
+            "SAFESTREAM_AUDIT_INTERVAL_S": "audit_interval_s",
         }
         data: dict[str, object] = {field: env[var] for var, field in names.items() if env.get(var)}
         data["client_overrides"] = {
@@ -263,10 +276,19 @@ class KafkaRedactionConnector:
         self.dead_lettered = 0
         self.batches = 0
         self.transaction_aborts = 0
+        self.audit_events = 0
+        self.audit_failures = 0
         self.ready = False
         self.heartbeat = time.monotonic()
         self._running = True
         self._delivery_errors: list[KafkaError] = []
+        # Audit window: counters are reported as deltas against the snapshot
+        # taken when the previous audit event was *acknowledged*, so a failed
+        # send is carried into the next window instead of being lost.
+        self.instance = socket.gethostname()  # the pod name on Kubernetes
+        self._audit_base = self.snapshot()
+        self._audit_window_start = datetime.now(timezone.utc)
+        self._audit_due = time.monotonic() + config.audit_interval_s
 
     def snapshot(self) -> ConnectorMetrics:
         """A content-free view for the health/metrics endpoint."""
@@ -277,6 +299,8 @@ class KafkaRedactionConnector:
             dlq_records=self.dead_lettered,
             batches=self.batches,
             transaction_aborts=self.transaction_aborts,
+            audit_events=self.audit_events,
+            audit_failures=self.audit_failures,
             redactions=dict(self.stats.counts),
         )
 
@@ -312,13 +336,138 @@ class KafkaRedactionConnector:
                 )
                 if batch:
                     self.process_batch(batch)
+                self._maybe_audit()
         finally:
             self.ready = False
+            try:
+                # Close the last window so no counts go unreported on shutdown.
+                self._maybe_audit(final=True)
+            except Exception as exc:  # never mask the exception that ended the loop
+                logger.error("final audit event not delivered (%s)", type(exc).__name__)
             # Order matters: flush in-flight egress first, then close the consumer
             # (which leaves the group so partitions rebalance immediately).
             self.producer.flush(self.config.flush_timeout_s)
             self.consumer.close()
             logger.info("stopped: %s; dead-lettered=%d", self.stats.summary(), self.dead_lettered)
+
+    # ------------------------------------------------------------------
+    # compliance audit events
+    # ------------------------------------------------------------------
+
+    def audit_event(
+        self,
+        base: ConnectorMetrics,
+        current: ConnectorMetrics,
+        start: datetime,
+        end: datetime,
+        final: bool,
+    ) -> dict[str, object]:
+        """One content-free audit event covering ``start``..``end``.
+
+        Counts only, plus the configuration an auditor needs to interpret them:
+        which delivery and redaction modes ran, and a fingerprint of the exact
+        field-rule table in force (the rules themselves are not included).
+        """
+        redactions = {
+            entity: n - base.redactions.get(entity, 0)
+            for entity, n in sorted(current.redactions.items())
+            if n - base.redactions.get(entity, 0) > 0
+        }
+        return {
+            "schema": AUDIT_SCHEMA,
+            "connector_version": __version__,
+            "instance": self.instance,
+            "group_id": self.config.group_id,
+            "topics": {
+                "ingress": self.config.ingress_topic,
+                "egress": self.config.egress_topic,
+                "dlq": self.config.dlq_topic,
+            },
+            "delivery": self.config.delivery,
+            "redaction_mode": self.config.redaction_mode.value,
+            "field_rules": {
+                "count": getattr(self.redactor, "rule_count", None),
+                "fingerprint": getattr(self.redactor, "rules_fingerprint", None),
+            },
+            "window": {
+                "start": start.isoformat(timespec="milliseconds"),
+                "end": end.isoformat(timespec="milliseconds"),
+                "final": final,
+            },
+            "records": {
+                "egress": current.egress_records - base.egress_records,
+                "dlq": current.dlq_records - base.dlq_records,
+            },
+            "redactions": redactions,
+            "batches": current.batches - base.batches,
+            "transaction_aborts": current.transaction_aborts - base.transaction_aborts,
+        }
+
+    def _maybe_audit(self, final: bool = False) -> None:
+        """Publish the audit event for the current window if it is due.
+
+        Runs on the main loop between batches, so it never interleaves with a
+        batch's transaction. Every window is reported, including empty ones:
+        "nothing processed" is evidence too.
+        """
+        if not self.config.audit_topic:
+            return
+        now = time.monotonic()
+        if not final and now < self._audit_due:
+            return
+        self._audit_due = now + self.config.audit_interval_s
+        current = self.snapshot()
+        end = datetime.now(timezone.utc)
+        event = self.audit_event(self._audit_base, current, self._audit_window_start, end, final)
+        if self._publish_audit(orjson.dumps(event)):
+            self._audit_base, self._audit_window_start = current, end
+            self.audit_events += 1
+        else:
+            self.audit_failures += 1
+
+    def _publish_audit(self, data: bytes) -> bool:
+        """Deliver one audit event; ``False`` (logged) if it was not acknowledged.
+
+        A lost audit event never stops redaction: the window simply stays open
+        and the next event covers it. Only a fatal producer error (e.g. fenced
+        by a newer instance) propagates, as it would from a batch.
+        """
+        assert self.config.audit_topic is not None
+        errors: list[KafkaError] = []
+
+        def on_delivery(err: KafkaError | None, _msg: Message) -> None:
+            if err is not None:
+                errors.append(err)
+
+        key = self.instance.encode()
+        try:
+            if self.config.exactly_once:
+                # A transactional producer can only write inside a transaction.
+                self.producer.begin_transaction()
+                try:
+                    self.producer.produce(
+                        self.config.audit_topic, value=data, key=key, on_delivery=on_delivery
+                    )
+                    self._commit_transaction()
+                except KafkaException as exc:
+                    if exc.args[0].txn_requires_abort():
+                        self.producer.abort_transaction(self.config.flush_timeout_s)
+                    raise
+            else:
+                self.producer.produce(
+                    self.config.audit_topic, value=data, key=key, on_delivery=on_delivery
+                )
+                if self.producer.flush(self.config.flush_timeout_s) or errors:
+                    raise DeliveryError(f"audit event not acknowledged: {errors[:1]}")
+        except KafkaException as exc:
+            if exc.args[0].fatal():
+                raise
+            logger.error("audit event not delivered (%s); window carried over", exc.args[0])
+            return False
+        except (DeliveryError, BufferError) as exc:
+            logger.error("audit event not delivered (%s); window carried over", exc)
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # batch processing
