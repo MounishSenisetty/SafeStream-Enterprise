@@ -67,7 +67,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: redactor
-          image: ghcr.io/mounishsenisetty/safestream-enterprise:0.1.0
+          image: ghcr.io/mounishsenisetty/safestream-enterprise:0.2.0
           imagePullPolicy: IfNotPresent
           env:
             - name: KAFKA_BOOTSTRAP_SERVERS

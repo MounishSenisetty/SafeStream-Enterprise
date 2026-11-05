@@ -8,7 +8,7 @@ from safestream_enterprise.parsers.json_ast import (
 )
 from safestream_enterprise.rules import FieldRulesError, load_field_rules
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "DEFAULT_FIELD_RULES",
