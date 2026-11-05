@@ -48,7 +48,7 @@ def test_metrics_exposition() -> None:
     ):
         assert line in body.splitlines()
     # every sample has HELP/TYPE metadata and the body ends with a newline
-    assert body.endswith("\n") and body.count("# TYPE") == 6
+    assert body.endswith("\n") and body.count("# TYPE") == 8
 
 
 def test_unknown_routes_and_methods() -> None:

@@ -48,6 +48,7 @@ generator, so an NDJSON stream of any size runs in O(largest record) memory.
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Iterable, Iterator, Mapping
 from fnmatch import translate
@@ -227,8 +228,10 @@ class StructuredRedactor:
         # Compile every rule once. Each entry: (regex, matches_raw_key, type).
         # Globs are normalised exactly like keys, so ``*Last_Name*`` works.
         rules: list[tuple[re.Pattern[str], bool, EntityType]] = []
+        canonical: list[tuple[str, str]] = []
         for pattern, et in field_rules.items():
             entity_type = et if isinstance(et, EntityType) else EntityType.from_name(et)
+            canonical.append((pattern, entity_type.value))
             if pattern.startswith(REGEX_PREFIX):
                 try:
                     regex = re.compile(pattern[len(REGEX_PREFIX) :], re.IGNORECASE)
@@ -240,6 +243,12 @@ class StructuredRedactor:
                 glob = _RULE_STRIP.sub("", pattern.lower())
                 rules.append((re.compile(translate(glob)), False, entity_type))
         self._rules: tuple[tuple[re.Pattern[str], bool, EntityType], ...] = tuple(rules)
+        #: Number of field rules in force.
+        self.rule_count = len(rules)
+        #: Identifies the exact rule table (patterns, types and order, since the
+        #: first match wins) without revealing it: audit events carry this so an
+        #: auditor can prove which rule set applied to a window.
+        self.rules_fingerprint = "sha256:" + hashlib.sha256(orjson.dumps(canonical)).hexdigest()
         # Per-instance cache (a module-level one would leak rules across
         # instances). lru_cache is thread-safe for concurrent readers.
         self.classify_key = lru_cache(maxsize=key_cache_size)(self._classify_key)

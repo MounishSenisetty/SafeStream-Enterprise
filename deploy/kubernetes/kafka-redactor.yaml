@@ -101,6 +101,13 @@ spec:
               value: "at_least_once"
             - name: SAFESTREAM_FIELD_RULES_FILE
               value: "/etc/safestream/field-rules.json"
+            # Compliance audit events: one content-free JSON event per window
+            # (counts, modes, field-rule fingerprint) to this topic. Create it first
+            # with long retention and grant this service Write on it, then uncomment.
+            # - name: SAFESTREAM_AUDIT_TOPIC
+            #   value: "safestream-audit"
+            # - name: SAFESTREAM_AUDIT_INTERVAL_S
+            #   value: "60"
             - name: SAFESTREAM_MODE
               value: "pseudonymize"
             - name: SAFESTREAM_HMAC_KEY

@@ -42,6 +42,8 @@ class ConnectorMetrics(NamedTuple):
     transaction_aborts: int
     #: Redactions per entity type (``"email" -> 12``).
     redactions: dict[str, int]
+    audit_events: int = 0
+    audit_failures: int = 0
 
 
 def render_metrics(m: ConnectorMetrics, now: float) -> str:
@@ -66,6 +68,12 @@ def render_metrics(m: ConnectorMetrics, now: float) -> str:
         "# HELP safestream_transaction_aborts_total Aborted transactions (exactly_once).",
         "# TYPE safestream_transaction_aborts_total counter",
         f"safestream_transaction_aborts_total {m.transaction_aborts}",
+        "# HELP safestream_audit_events_total Compliance audit events delivered.",
+        "# TYPE safestream_audit_events_total counter",
+        f"safestream_audit_events_total {m.audit_events}",
+        "# HELP safestream_audit_failures_total Audit events not delivered (window carried over).",
+        "# TYPE safestream_audit_failures_total counter",
+        f"safestream_audit_failures_total {m.audit_failures}",
         "# HELP safestream_heartbeat_age_seconds Seconds since the main loop last advanced.",
         "# TYPE safestream_heartbeat_age_seconds gauge",
         f"safestream_heartbeat_age_seconds {max(0.0, now - m.heartbeat):.3f}",

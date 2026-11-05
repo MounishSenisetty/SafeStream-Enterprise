@@ -106,9 +106,11 @@ remains a property of your environment and your audit.
 | **GDPR** | Names, contact data, online identifiers, national IDs | Art. 25 data protection by design; Art. 32 pseudonymization |
 | **SOC 2** | Passwords, API keys, tokens, private keys, session cookies | CC6.1 logical access, CC6.7 data in transmission |
 
-Every run produces **content-free reports**: counts per entity type and record sizes, never
-the redacted values. You can file them as audit evidence without creating a new sensitive
-artifact.
+The Kafka connector publishes **content-free audit events**: per-window counts of what was
+redacted, by entity type, together with the delivery mode, redaction mode and a fingerprint of
+the field rules in force. They never contain the redacted values. You can file them as audit
+evidence without creating a new sensitive artifact. See
+[Compliance audit events](#compliance-audit-events).
 
 ## Deploy in minutes
 
@@ -162,6 +164,8 @@ with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
 | `SAFESTREAM_UNPARSEABLE` | `dlq` | Payloads that are neither JSON nor XML. `dlq`: send them to the DLQ. `redact_text`: text-redact them and deliver them to egress |
 | `SAFESTREAM_DELIVERY` | `at_least_once` | `at_least_once` or `exactly_once` (one transaction per batch; needs transactional-ID write permission on the brokers) |
 | `SAFESTREAM_FIELD_RULES_FILE` | none | JSON file of customer field rules, usually a mounted ConfigMap. See [Custom field rules](#custom-field-rules) |
+| `SAFESTREAM_AUDIT_TOPIC` | none | Topic for compliance audit events; unset turns auditing off. See [Compliance audit events](#compliance-audit-events) |
+| `SAFESTREAM_AUDIT_INTERVAL_S` | `60` | Seconds per audit window (minimum 1) |
 | `SAFESTREAM_METRICS_PORT` | `9400` | Port for `/healthz`, `/readyz` and `/metrics`; `0` turns the endpoint off. See [Monitoring](#monitoring) |
 | `SAFESTREAM_LIVENESS_TIMEOUT_S` | `120` | `/healthz` fails once the main loop hasn't advanced for this long. Must be at least twice `SAFESTREAM_FLUSH_TIMEOUT_S` |
 | `SAFESTREAM_TRANSACTIONAL_ID` | `<group id>-<hostname>` | Exactly-once only. The default (the pod name on Kubernetes) is unique per instance, which is all exactly-once needs |
@@ -212,6 +216,43 @@ from safestream_enterprise import StructuredRedactor, load_field_rules
 redactor = StructuredRedactor(field_rules=load_field_rules("field-rules.json"))
 ```
 
+### Compliance audit events
+
+With `SAFESTREAM_AUDIT_TOPIC` set, every connector instance publishes one event per window
+(`SAFESTREAM_AUDIT_INTERVAL_S`, default 60s), so evidence of what the pipeline removed comes
+from the pipeline itself rather than from scraping logs or keeping metrics for years:
+
+```json
+{
+  "schema": "safestream.audit/v1",
+  "connector_version": "0.2.0",
+  "instance": "safestream-kafka-redactor-7d9f8-x2k4q",
+  "group_id": "safestream-redactor",
+  "topics": {"ingress": "ingress-logs", "egress": "egress-logs-clean", "dlq": "ingress-logs-dlq"},
+  "delivery": "exactly_once",
+  "redaction_mode": "pseudonymize",
+  "field_rules": {"count": 68, "fingerprint": "sha256:3f1c…"},
+  "window": {"start": "2026-11-05T12:00:00.000+00:00", "end": "2026-11-05T12:01:00.000+00:00", "final": false},
+  "records": {"egress": 48210, "dlq": 3},
+  "redactions": {"email": 9120, "person": 4471, "secret": 37},
+  "batches": 97,
+  "transaction_aborts": 0
+}
+```
+
+- **Content-free.** An event holds counts, entity-type names and configuration, never record
+  values. The field rules appear as a fingerprint (a SHA-256 of the exact rule table, order
+  included), which proves which rule set applied without revealing it.
+- **No gaps.** A window closes only when its event is acknowledged. If a send fails, the
+  failure is logged and counted in `safestream_audit_failures_total`, and the next event covers
+  the whole period. A final event closes the window on shutdown. Empty windows are reported
+  too, since "nothing processed" is evidence as well.
+- **Never blocks redaction.** An audit failure doesn't stop the pipeline. In exactly-once mode
+  each event is its own small transaction.
+- **Setup.** Create the topic with the retention your audit policy needs, and grant the
+  connector's account Write on it. Events are keyed by instance, so each pod's events stay in
+  order.
+
 ### Monitoring
 
 The connector serves three endpoints on `SAFESTREAM_METRICS_PORT` (default 9400). The
@@ -229,6 +270,8 @@ Kubernetes manifest wires them up as probes and for Prometheus scraping.
 | `safestream_redactions_total{entity_type="..."}` | counter | Values redacted, by entity type: compliance evidence of what the pipeline removed |
 | `safestream_batches_total` | counter | Batches committed |
 | `safestream_transaction_aborts_total` | counter | Aborted transactions (exactly-once); a sustained rate points at broker trouble |
+| `safestream_audit_events_total` | counter | Audit events delivered |
+| `safestream_audit_failures_total` | counter | Audit events not delivered; the window is carried into the next event |
 | `safestream_heartbeat_age_seconds` | gauge | Seconds since the main loop last advanced |
 | `safestream_ready` | gauge | 1 while consuming |
 
