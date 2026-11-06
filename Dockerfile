@@ -1,5 +1,5 @@
 # SafeStream Enterprise Kafka connector.
-#   docker build -t safestream-enterprise:0.2.1 .
+#   docker build -t safestream-enterprise:0.3.0 .
 #
 # Two stages: dependencies are installed with pip in a full Debian image, then
 # copied into a distroless runtime that has no shell, no package manager and no
