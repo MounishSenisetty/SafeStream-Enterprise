@@ -1,4 +1,5 @@
 import json
+from collections import Counter
 
 import pytest
 from safestream_redactor import RedactionMode, RedactionPolicy, RedactionStats, Redactor
@@ -15,10 +16,10 @@ def redact(obj: object) -> object:
 
 
 def test_catches_what_the_text_engine_misses() -> None:
-    line = '{"LastName": "Smith", "password": "hunter2", "Phone": "555 0100", "host": "web-1"}'
-    assert "Smith" in Redactor().redact(line)  # the OSS gap this module closes
+    line = '{"patient_mrn": "MR-4821", "password": "hunter2", "Phone": "555 0100", "host": "web-1"}'
+    assert "MR-4821" in Redactor().redact(line)  # the OSS gap this module closes
     assert redact(json.loads(line)) == {
-        "LastName": "[REDACTED]",
+        "patient_mrn": "[REDACTED]",
         "password": "[REDACTED]",
         "Phone": "[REDACTED]",
         "host": "web-1",
@@ -68,7 +69,8 @@ def test_too_deep_or_invalid_json_falls_back_or_raises_in_strict_mode() -> None:
     stats = RedactionStats()
     assert not R.redact_line(too_deep, stats).structured
     assert not R.redact_line(hostile).structured
-    assert "secret" not in stats.counts  # the failed structured walk wasn't counted
+    # Only the text fallback is counted, not the failed structured walk too.
+    assert stats.counts == Counter(d.entity_type.value for d in R.redactor.detect(too_deep))
     for bad in (too_deep, hostile, b"\xff not json", '{"password": "hunter2"'):
         with pytest.raises(StructuredParseError) as info:
             R.redact_line(bad, strict=True)

@@ -83,7 +83,7 @@ _RULE_STRIP = re.compile(r"[^0-9a-z*?]+")
 #: ``*name*`` would also redact ``hostname``/``filename``/``service_name`` and
 #: destroy the operational value of every log line.
 #:
-#: Entity types are limited to the published ``safestream-redactor`` 0.4.x API:
+#: Entity types are limited to the published ``safestream-redactor`` 0.5.x API:
 #: usernames, IBANs and street addresses move to dedicated types once the OSS
 #: release carrying ``USERNAME``/``IBAN``/``ADDRESS`` ships.
 DEFAULT_FIELD_RULES: Mapping[str, EntityType] = {
@@ -157,7 +157,7 @@ DEFAULT_FIELD_RULES: Mapping[str, EntityType] = {
     "*clientip*": EntityType.IPV4,
     "*remoteaddr*": EntityType.IPV4,
     # --- health (HIPAA Safe Harbor identifiers) ------------------------------
-    "mrn": EntityType.ID_NUMBER,
+    "*mrn*": EntityType.ID_NUMBER,
     "*medicalrecord*": EntityType.ID_NUMBER,
     "*healthplan*": EntityType.ID_NUMBER,
     "*insuranceid*": EntityType.ID_NUMBER,
