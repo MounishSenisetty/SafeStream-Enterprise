@@ -101,6 +101,15 @@ def test_policy_and_custom_rules_and_stats() -> None:
     assert dict(stats.counts) == {"id_number": 2, "email": 1}
 
 
+def test_iban_fields_use_the_iban_type() -> None:
+    policy = RedactionPolicy(mode=RedactionMode.PSEUDONYMIZE, hmac_key=b"k" * 32)
+    r = StructuredRedactor(Redactor(policy=policy))
+    stats = RedactionStats()
+    out = json.loads(r.redact_line('{"payee_IBAN": "GB82WEST12345698765432"}', stats).text)
+    assert out["payee_IBAN"].startswith("<IBAN_")
+    assert dict(stats.counts) == {"iban": 1}
+
+
 def test_ndjson_stream() -> None:
     lines = ['{"email": "a"}\n', "\n", "plain bob@corp.example\n"]
     assert list(R.redact_lines(lines)) == ['{"email":"[REDACTED]"}', "", "plain [REDACTED]"]

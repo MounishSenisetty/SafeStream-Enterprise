@@ -83,9 +83,7 @@ _RULE_STRIP = re.compile(r"[^0-9a-z*?]+")
 #: ``*name*`` would also redact ``hostname``/``filename``/``service_name`` and
 #: destroy the operational value of every log line.
 #:
-#: Entity types are limited to the published ``safestream-redactor`` 0.5.x API:
-#: usernames, IBANs and street addresses move to dedicated types once the OSS
-#: release carrying ``USERNAME``/``IBAN``/``ADDRESS`` ships.
+#: Entity types are limited to the published ``safestream-redactor`` 0.5.x API.
 DEFAULT_FIELD_RULES: Mapping[str, EntityType] = {
     # --- credentials (PCI-DSS 8, SOC 2 CC6) ---------------------------------
     "*password*": EntityType.SECRET,
@@ -108,7 +106,7 @@ DEFAULT_FIELD_RULES: Mapping[str, EntityType] = {
     "pan": EntityType.CREDIT_CARD,
     "*cvv*": EntityType.CREDIT_CARD,
     "*cvc*": EntityType.CREDIT_CARD,
-    "*iban*": EntityType.ID_NUMBER,
+    "*iban*": EntityType.IBAN,
     "*accountnumber*": EntityType.ID_NUMBER,
     "*routingnumber*": EntityType.ID_NUMBER,
     # --- contact data (GDPR Art. 4, HIPAA identifiers) ----------------------
