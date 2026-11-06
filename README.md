@@ -164,7 +164,7 @@ aws s3 cp s3://lake/raw/app.ndjson.gz - | gunzip | safestream-batch - | gzip | a
 - **Secrets.** `SAFESTREAM_HMAC_KEY` comes from the environment, never from an argument, which
   other users could see in the process list.
 - **In the container image:**
-  `docker run -i --entrypoint /usr/bin/python3 ghcr.io/mounishsenisetty/safestream-enterprise:0.2.0 -m safestream_enterprise.batch -`.
+  `docker run -i --entrypoint /usr/bin/python3 ghcr.io/mounishsenisetty/safestream-enterprise:0.2.1 -m safestream_enterprise.batch -`.
 
 **Python library** (Spark UDFs, custom services):
 
@@ -257,7 +257,7 @@ from the pipeline itself rather than from scraping logs or keeping metrics for y
 ```json
 {
   "schema": "safestream.audit/v1",
-  "connector_version": "0.2.0",
+  "connector_version": "0.2.1",
   "instance": "safestream-kafka-redactor-7d9f8-x2k4q",
   "group_id": "safestream-redactor",
   "topics": {"ingress": "ingress-logs", "egress": "egress-logs-clean", "dlq": "ingress-logs-dlq"},
