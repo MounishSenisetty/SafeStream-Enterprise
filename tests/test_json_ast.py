@@ -101,13 +101,23 @@ def test_policy_and_custom_rules_and_stats() -> None:
     assert dict(stats.counts) == {"id_number": 2, "email": 1}
 
 
-def test_iban_fields_use_the_iban_type() -> None:
+@pytest.mark.parametrize(
+    ("key", "value", "entity"),
+    [
+        ("payee_IBAN", "GB82WEST12345698765432", "iban"),
+        ("userName", "jdoe", "username"),
+        ("login", "jdoe", "username"),
+        ("billing_address", "1 Main St", "address"),
+        ("zipCode", "94107", "address"),
+    ],
+)
+def test_fields_use_their_dedicated_type(key: str, value: str, entity: str) -> None:
     policy = RedactionPolicy(mode=RedactionMode.PSEUDONYMIZE, hmac_key=b"k" * 32)
     r = StructuredRedactor(Redactor(policy=policy))
     stats = RedactionStats()
-    out = json.loads(r.redact_line('{"payee_IBAN": "GB82WEST12345698765432"}', stats).text)
-    assert out["payee_IBAN"].startswith("<IBAN_")
-    assert dict(stats.counts) == {"iban": 1}
+    out = json.loads(r.redact_line(json.dumps({key: value}), stats).text)
+    assert out[key].startswith(f"<{entity.upper()}_")
+    assert dict(stats.counts) == {entity: 1}
 
 
 def test_ndjson_stream() -> None:
