@@ -1,0 +1,69 @@
+# Alerts for the SafeStream Enterprise Kafka connector (Prometheus Operator).
+# Optional: apply it only where the PrometheusRule CRD is installed.
+#   kubectl apply -f deploy/kubernetes/prometheus-rules.yaml
+# Without the operator, copy spec.groups into a plain Prometheus rules file.
+# Thresholds are starting points; consumer lag is alerted on from your Kafka
+# exporter (group = KAFKA_GROUP_ID), which sees it even when every pod is down.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: safestream-kafka-redactor
+  namespace: safestream
+  labels:
+    app.kubernetes.io/name: safestream-kafka-redactor
+spec:
+  groups:
+    - name: safestream-kafka-redactor
+      rules:
+        - alert: SafeStreamNotConsuming
+          # absent(): also fires when every pod is gone and the series with it.
+          expr: sum(safestream_ready) < 1 or absent(safestream_ready)
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: No SafeStream connector is consuming.
+            description: >-
+              No replica has been ready for 5 minutes. Raw records are piling
+              up on the ingress topic and nothing reaches the clean topic.
+        - alert: SafeStreamMainLoopStalled
+          expr: safestream_heartbeat_age_seconds > 120
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: SafeStream connector {{ $labels.pod }} has stopped advancing.
+            description: >-
+              The main loop has not advanced for {{ $value | humanizeDuration }}.
+              The liveness probe should restart the pod; if this persists, it is not.
+        - alert: SafeStreamDeadLetterRate
+          expr: sum(rate(safestream_records_total{destination="dlq"}[5m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: SafeStream is dead-lettering records.
+            description: >-
+              Records have been going to the DLQ for 15 minutes: a producer is
+              sending records that are neither JSON nor XML, or the clean topic
+              is rejecting them. The x-safestream-error header names the cause.
+        - alert: SafeStreamTransactionAborts
+          expr: sum(increase(safestream_transaction_aborts_total[10m])) > 5
+          labels:
+            severity: warning
+          annotations:
+            summary: SafeStream transactions keep aborting.
+            description: >-
+              More than 5 aborted transactions in 10 minutes (exactly-once mode).
+              Check broker health and the transaction coordinator.
+        - alert: SafeStreamAuditEventsFailing
+          expr: sum(increase(safestream_audit_failures_total[15m])) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: SafeStream audit events are not being delivered.
+            description: >-
+              Redaction continues and no counts are lost (each window is carried
+              into the next event), but the audit topic is receiving nothing.
+              Check the topic exists and the connector may write to it.

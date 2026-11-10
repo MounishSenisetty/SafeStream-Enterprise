@@ -4,7 +4,7 @@
 # records to ingress-logs-dlq. Replicas share one consumer group: scale up to
 # the ingress topic's partition count (extra replicas sit idle).
 #
-#   kubectl create namespace safestream
+#   kubectl create namespace safestream   # first, so the Secret has somewhere to go
 #   kubectl -n safestream create secret generic safestream-secrets \
 #     --from-literal=hmac-key="$(openssl rand -hex 32)" \
 #     --from-literal=sasl-username=svc-safestream \
@@ -14,6 +14,17 @@
 # Assumes the brokers run in namespace "kafka" with pod label
 # app.kubernetes.io/name=kafka, listening on 9092. Adjust the NetworkPolicy
 # selectors to match your cluster (e.g. strimzi.io/cluster for Strimzi).
+---
+# The namespace enforces the "restricted" Pod Security Standard: a pod that is
+# root, privileged or missing the hardening below is rejected at admission.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: safestream
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
 ---
 # Customer field rules, added to the built-in PCI/HIPAA/GDPR rules (see
 # "Custom field rules" in the README for the format). They are read once at
@@ -46,6 +57,13 @@ metadata:
     app.kubernetes.io/name: safestream-kafka-redactor
 spec:
   replicas: 3
+  # One pod at a time, and no surge pod: an extra consumer-group member would
+  # only add a rebalance (and sits idle beyond the partition count).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: safestream-kafka-redactor
@@ -65,6 +83,21 @@ spec:
       terminationGracePeriodSeconds: 60
       # The connector never talks to the Kubernetes API.
       automountServiceAccountToken: false
+      # Spread replicas over nodes and zones so one failure takes out one
+      # consumer, not the group. Best-effort: a small cluster still schedules.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: safestream-kafka-redactor
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: safestream-kafka-redactor
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -155,6 +188,18 @@ spec:
         - name: field-rules
           configMap:
             name: safestream-field-rules
+---
+# Node drains and cluster upgrades evict at most one replica at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: safestream-kafka-redactor
+  namespace: safestream
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: safestream-kafka-redactor
 ---
 # Default-deny for the connector pods. Selecting a pod with both policy types
 # denies all ingress and all egress not explicitly allowed below, so the only
