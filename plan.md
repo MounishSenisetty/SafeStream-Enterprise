@@ -156,8 +156,8 @@ Each phase is one or a few PRs, independently shippable, with its own verificati
 
 | # | Phase | Deliverables | Verified by |
 |---|---|---|---|
-| 0 | Plan in repo | `plan.md` committed at the root | file on `main` |
-| 1 | Measure and prove the data plane | `bench/` harness and published numbers; latency histograms and lag metric; Hypothesis tests for both parsers; broker-restart integration test | CI green; benchmark report in `docs/` |
+| 0 | Plan in repo (done) | `plan.md` committed at the root | file on `main` |
+| 1 | Measure and prove the data plane (done; results in `docs/benchmarks.md`) | `bench/` harness and published numbers; latency histograms and lag metric; Hypothesis tests for both parsers; broker-restart integration test | CI green; benchmark report in `docs/` |
 | 2 | Operability | `safestream-dlq replay` CLI; Helm chart in `deploy/helm/` (existing manifest becomes its rendered output, checked in CI); KEDA lag autoscaling; Grafana dashboard | `helm lint`, kubeconform, kind e2e job |
 | 3 | Signed policy bundles | Bundle format and `safestream-policy sign/verify`; agent verifies and hot-swaps between batches; last-known-good fallback; bundle version in metrics and audit events. Reuses `FieldRulesFile` and `rules_fingerprint` | unit tests for every refusal path; integration test swapping policy under load with no restart |
 | 4 | Shadow mode and audit chain | Candidate bundle evaluated in shadow with count diffs; `safestream.audit/v2` hash chain; `safestream-audit verify` | tests: shadow never changes output; a deleted or edited event fails verification |

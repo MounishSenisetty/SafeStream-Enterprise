@@ -22,12 +22,55 @@ from __future__ import annotations
 
 import threading
 import time
+from bisect import bisect_left
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import NamedTuple
 
 #: Socket read timeout per connection, so a stalled client cannot pin a thread.
 _REQUEST_TIMEOUT_S = 5.0
+
+
+#: Upper bounds (seconds). A batch is up to SAFESTREAM_BATCH_SIZE records plus
+#: the wait for broker acknowledgement; a record is one redaction.
+BATCH_BUCKETS = (0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
+RECORD_BUCKETS = (0.00005, 0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.05, 0.25)
+
+
+class Histogram:
+    """A fixed-bucket Prometheus histogram.
+
+    Written by the main loop and read by the health thread without a lock: a
+    scrape can be one observation behind, never corrupt.
+    """
+
+    def __init__(self, buckets: tuple[float, ...]) -> None:
+        self.buckets = buckets
+        self.counts = [0] * (len(buckets) + 1)  # last slot: above every bound (+Inf)
+        self.sum = 0.0
+
+    def observe(self, value: float) -> None:
+        self.counts[bisect_left(self.buckets, value)] += 1
+        self.sum += value
+
+    def copy(self) -> Histogram:
+        out = Histogram(self.buckets)
+        out.counts, out.sum = self.counts[:], self.sum
+        return out
+
+    def render(self, name: str, help_text: str) -> list[str]:
+        lines = [f"# HELP {name} {help_text}", f"# TYPE {name} histogram"]
+        total = 0
+        for bound, n in zip(self.buckets, self.counts, strict=False):
+            total += n
+            lines.append(f'{name}_bucket{{le="{bound:g}"}} {total}')
+        total += self.counts[-1]
+        lines += [
+            f'{name}_bucket{{le="+Inf"}} {total}',
+            f"{name}_sum {self.sum:.6f}",
+            f"{name}_count {total}",
+        ]
+        return lines
 
 
 class ConnectorMetrics(NamedTuple):
@@ -44,6 +87,12 @@ class ConnectorMetrics(NamedTuple):
     redactions: dict[str, int]
     audit_events: int = 0
     audit_failures: int = 0
+    #: Records between this instance's position and the end of its partitions;
+    #: ``None`` until it has a position on at least one.
+    lag: int | None = None
+    assigned_partitions: int = 0
+    batch_seconds: Histogram | None = None
+    record_seconds: Histogram | None = None
 
 
 def render_metrics(m: ConnectorMetrics, now: float) -> str:
@@ -74,6 +123,9 @@ def render_metrics(m: ConnectorMetrics, now: float) -> str:
         "# HELP safestream_audit_failures_total Audit events not delivered (window carried over).",
         "# TYPE safestream_audit_failures_total counter",
         f"safestream_audit_failures_total {m.audit_failures}",
+        "# HELP safestream_assigned_partitions Ingress partitions assigned to this instance.",
+        "# TYPE safestream_assigned_partitions gauge",
+        f"safestream_assigned_partitions {m.assigned_partitions}",
         "# HELP safestream_heartbeat_age_seconds Seconds since the main loop last advanced.",
         "# TYPE safestream_heartbeat_age_seconds gauge",
         f"safestream_heartbeat_age_seconds {max(0.0, now - m.heartbeat):.3f}",
@@ -81,6 +133,23 @@ def render_metrics(m: ConnectorMetrics, now: float) -> str:
         "# TYPE safestream_ready gauge",
         f"safestream_ready {int(m.ready)}",
     ]
+    if m.lag is not None:
+        lines += [
+            "# HELP safestream_consumer_lag_records Records not yet consumed on this "
+            "instance's partitions (as of its last fetch).",
+            "# TYPE safestream_consumer_lag_records gauge",
+            f"safestream_consumer_lag_records {m.lag}",
+        ]
+    if m.batch_seconds is not None:
+        lines += m.batch_seconds.render(
+            "safestream_batch_duration_seconds",
+            "Time to redact, publish and commit one batch.",
+        )
+    if m.record_seconds is not None:
+        lines += m.record_seconds.render(
+            "safestream_record_duration_seconds",
+            "Time to redact one record and hand it to the producer.",
+        )
     return "\n".join(lines) + "\n"
 
 

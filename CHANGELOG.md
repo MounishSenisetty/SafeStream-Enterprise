@@ -11,6 +11,10 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - An unknown `LOG_LEVEL` falls back to `INFO` with a warning instead of a traceback.
 
 ### Added
+- Metrics: batch and per-record duration histograms, consumer lag and assigned partitions.
+- `bench/run.py` and `docs/benchmarks.md`: measured throughput per core and end to end.
+- Property-based tests for the JSON and XML parsers; an integration test that kills the broker
+  mid-stream.
 - `LOG_FORMAT=json` for the connector and `safestream-batch`.
 - Kubernetes: Namespace enforcing the `restricted` Pod Security Standard, PodDisruptionBudget,
   topology spread across nodes and zones, an explicit rolling-update strategy, and

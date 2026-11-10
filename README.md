@@ -318,12 +318,17 @@ Kubernetes manifest wires them up as probes and for Prometheus scraping.
 | `safestream_transaction_aborts_total` | counter | Aborted transactions (exactly-once); a sustained rate points at broker trouble |
 | `safestream_audit_events_total` | counter | Audit events delivered |
 | `safestream_audit_failures_total` | counter | Audit events not delivered; the window is carried into the next event |
+| `safestream_batch_duration_seconds` | histogram | Time to redact, publish and commit one batch |
+| `safestream_record_duration_seconds` | histogram | Time to redact one record and hand it to the producer |
+| `safestream_consumer_lag_records` | gauge | Records not yet consumed on this instance's partitions, as of its last fetch. Absent until it has a position |
+| `safestream_assigned_partitions` | gauge | Ingress partitions assigned to this instance |
 | `safestream_heartbeat_age_seconds` | gauge | Seconds since the main loop last advanced |
 | `safestream_ready` | gauge | 1 while consuming |
 
 Ready-made alerts for these metrics are in `deploy/kubernetes/prometheus-rules.yaml`: no
 replica consuming, a stalled main loop, a sustained `dlq` rate (producers sending malformed
-records), repeated transaction aborts, and undelivered audit events. Consumer lag comes from your usual Kafka exporter,
+records), repeated transaction aborts, and undelivered audit events. The connector reports
+lag on the partitions it is consuming; lag on partitions nobody is consuming (every pod down) comes from your usual Kafka exporter,
 for example kafka-exporter or Burrow, under group `KAFKA_GROUP_ID`.
 
 The endpoint carries counts only, never record content, keys or headers, and it never logs
@@ -404,6 +409,9 @@ pip install -e ".[dev]"
 pytest && ruff check . && mypy
 ```
 
+Throughput is measured, not estimated: see [docs/benchmarks.md](docs/benchmarks.md), and run
+`python bench/run.py --bootstrap localhost:9092` to reproduce it on your hardware.
+
 Integration tests run against a real broker and, optionally, the built image. They are
 skipped unless the environment names a broker. CI runs them against an `apache/kafka`
 service container:
@@ -411,6 +419,10 @@ service container:
 ```bash
 SAFESTREAM_IT_BOOTSTRAP=localhost:9092 SAFESTREAM_IT_IMAGE=safestream-enterprise:ci pytest tests/test_kafka_integration.py
 ```
+
+Set `SAFESTREAM_IT_KAFKA_CONTAINER` to the broker's Docker container name as well, and the
+suite also kills the broker mid-stream and checks that no record is lost or, in exactly-once
+mode, duplicated.
 
 After changing dependencies in `pyproject.toml`, regenerate the lock file the image installs
 from (Dependabot keeps the pins in it current otherwise):

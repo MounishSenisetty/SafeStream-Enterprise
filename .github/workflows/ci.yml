@@ -41,6 +41,10 @@ jobs:
       - run: mypy
       # Integration tests skip themselves here (no broker).
       - run: pytest -q --cov=safestream_enterprise --cov-fail-under=90
+      # A floor, not a tight gate: shared runners are too noisy for a percentage
+      # comparison. It catches an accidental 2x slowdown (docs/benchmarks.md has
+      # the measured numbers).
+      - run: python bench/run.py --seconds 2 --min-rate 1000
 
   audit:
     name: dependency vulnerabilities (pip-audit)
@@ -86,6 +90,8 @@ jobs:
         env:
           SAFESTREAM_IT_BOOTSTRAP: localhost:9092
           SAFESTREAM_IT_IMAGE: safestream-enterprise:ci
+          # Lets the fault-injection test kill and restart the broker.
+          SAFESTREAM_IT_KAFKA_CONTAINER: ${{ job.services.kafka.id }}
         run: pytest -v -rs tests/test_kafka_integration.py
       - name: image vulnerability scan (fixable HIGH/CRITICAL fail the build)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0

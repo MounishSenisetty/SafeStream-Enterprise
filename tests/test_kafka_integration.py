@@ -21,7 +21,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from confluent_kafka import Consumer, Message, Producer, TopicPartition
+from confluent_kafka import Consumer, KafkaException, Message, Producer, TopicPartition
 from confluent_kafka.admin import (
     AdminClient,
     AlterConfigOpType,
@@ -33,12 +33,15 @@ from confluent_kafka.admin import (
 from safestream_enterprise import DEFAULT_FIELD_RULES
 from safestream_enterprise.connectors.kafka import (
     ConnectorConfig,
+    DeliveryError,
     KafkaRedactionConnector,
     build_redactor,
 )
 
 BOOTSTRAP = os.environ.get("SAFESTREAM_IT_BOOTSTRAP", "")
 IMAGE = os.environ.get("SAFESTREAM_IT_IMAGE", "")
+#: Docker container running the broker, so a test can kill and restart it.
+KAFKA_CONTAINER = os.environ.get("SAFESTREAM_IT_KAFKA_CONTAINER", "")
 pytestmark = pytest.mark.skipif(not BOOTSTRAP, reason="SAFESTREAM_IT_BOOTSTRAP not set")
 
 PII_RECORD = {"LastName": "Smith", "password": "hunter2", "msg": "mail bob@corp.example"}
@@ -267,6 +270,81 @@ def test_record_the_egress_topic_rejects_is_dead_lettered(
     assert [m.value() for m in dead] == [big]  # the original, for replay after a fix
     assert dict(dead[0].headers() or [])["x-safestream-error"] == b"MSG_SIZE_TOO_LARGE"
     assert committed_lag(group, topics["ingress"]) == 0
+
+
+@pytest.mark.skipif(not KAFKA_CONTAINER, reason="SAFESTREAM_IT_KAFKA_CONTAINER not set")
+@pytest.mark.parametrize("delivery", ["at_least_once", "exactly_once"])
+def test_broker_killed_mid_stream_loses_nothing(topics: dict[str, str], delivery: str) -> None:
+    """Kill the broker under load; restart the connector whenever it exits, as
+    Kubernetes would. Every record must arrive, and in exactly_once only once."""
+    n = 20_000
+    produce(
+        topics["ingress"],
+        [(None, json.dumps({"id": i, "email": "bob@corp.example"}).encode()) for i in range(n)],
+    )
+    group = f"it-connector-{uuid.uuid4().hex[:8]}"
+    config = ConnectorConfig(
+        bootstrap_servers=BOOTSTRAP,
+        group_id=group,
+        ingress_topic=topics["ingress"],
+        egress_topic=topics["egress"],
+        dlq_topic=topics["dlq"],
+        delivery=delivery,  # type: ignore[arg-type]
+        batch_size=50,
+        poll_timeout_s=0.5,
+        flush_timeout_s=10,
+        metrics_port=0,
+    )
+
+    def lag() -> int:
+        try:
+            return committed_lag(group, topics["ingress"])
+        except KafkaException:
+            return n  # broker down: nothing is known to be committed
+
+    killed = False
+    exits = 0
+    deadline = time.monotonic() + 300
+    while lag() > 0:
+        assert time.monotonic() < deadline, "connector never caught up after the broker came back"
+        connector = KafkaRedactionConnector(
+            config,
+            build_redactor(config),
+            Consumer(config.consumer_config()),
+            Producer(config.producer_config()),
+        )
+        failure: list[BaseException] = []
+
+        def run(c: KafkaRedactionConnector = connector, f: list[BaseException] = failure) -> None:
+            try:
+                c.run()
+            except (KafkaException, DeliveryError) as exc:  # what main() exits 1 on
+                f.append(exc)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        if not killed:
+            while connector.egress_records < 2_000 and thread.is_alive():
+                time.sleep(0.01)
+            # SIGKILL, mid-batch: no clean shutdown, open transactions left behind.
+            subprocess.run(["docker", "kill", KAFKA_CONTAINER], check=True, capture_output=True)
+            time.sleep(3)
+            subprocess.run(["docker", "start", KAFKA_CONTAINER], check=True, capture_output=True)
+            killed = True
+        while thread.is_alive() and lag() > 0 and time.monotonic() < deadline:
+            time.sleep(1)
+        connector.stop()
+        thread.join(60)
+        assert not thread.is_alive(), "connector did not stop"
+        exits += bool(failure)
+
+    ids = sorted(json.loads(m.value() or b"{}")["id"] for m in drain(topics["egress"], expected=n))
+    if delivery == "exactly_once":
+        assert ids == list(range(n))  # nothing lost, nothing duplicated
+    else:
+        assert set(ids) == set(range(n))  # nothing lost; replays may duplicate
+    assert drain(topics["dlq"], expected=0, timeout_s=1) == []
+    print(f"{delivery}: connector exits={exits}, duplicates={len(ids) - n}")
 
 
 @pytest.mark.skipif(not IMAGE, reason="SAFESTREAM_IT_IMAGE not set")

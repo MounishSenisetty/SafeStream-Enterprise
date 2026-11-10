@@ -83,7 +83,13 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, m
 from safestream_redactor import RedactionMode, RedactionStats
 
 from safestream_enterprise import __version__
-from safestream_enterprise.connectors.health import ConnectorMetrics, HealthServer
+from safestream_enterprise.connectors.health import (
+    BATCH_BUCKETS,
+    RECORD_BUCKETS,
+    ConnectorMetrics,
+    HealthServer,
+    Histogram,
+)
 from safestream_enterprise.logs import configure_logging
 from safestream_enterprise.parsers.json_ast import StructuredRedactor
 from safestream_enterprise.rules import make_redactor
@@ -309,6 +315,10 @@ class KafkaRedactionConnector:
         self.transaction_aborts = 0
         self.audit_events = 0
         self.audit_failures = 0
+        self.lag: int | None = None
+        self.assigned_partitions = 0
+        self.batch_seconds = Histogram(BATCH_BUCKETS)
+        self.record_seconds = Histogram(RECORD_BUCKETS)
         self.ready = False
         self.heartbeat = time.monotonic()
         self._running = True
@@ -342,7 +352,30 @@ class KafkaRedactionConnector:
             audit_events=self.audit_events,
             audit_failures=self.audit_failures,
             redactions=dict(self.stats.counts),
+            lag=self.lag,
+            assigned_partitions=self.assigned_partitions,
+            batch_seconds=self.batch_seconds.copy(),
+            record_seconds=self.record_seconds.copy(),
         )
+
+    def _update_lag(self) -> None:
+        """Refresh lag from librdkafka's local state (no broker round trip).
+
+        Counts partitions this instance has a position on. Lag on partitions
+        nobody is consuming is only visible to a Kafka-side exporter.
+        """
+        try:
+            positions = self.consumer.position(self.consumer.assignment())
+            lag: int | None = None
+            for tp in positions:
+                if tp.offset < 0:
+                    continue  # nothing fetched from this partition yet
+                _low, high = self.consumer.get_watermark_offsets(tp, cached=True)
+                if high >= 0:
+                    lag = (lag or 0) + max(0, high - tp.offset)
+            self.lag, self.assigned_partitions = lag, len(positions)
+        except KafkaException:
+            pass  # e.g. mid-rebalance: keep the last value
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -376,6 +409,7 @@ class KafkaRedactionConnector:
                 )
                 if batch:
                     self.process_batch(batch)
+                self._update_lag()
                 self._maybe_audit()
         finally:
             self.ready = False
@@ -650,14 +684,18 @@ class KafkaRedactionConnector:
                 logger.warning("consumer error: %s", err)
         if not messages:
             return  # only error events: no new offsets to commit
+        started = time.perf_counter()
         if self.config.exactly_once:
             self._process_transactional(messages)
         else:
             self._process_at_least_once(messages)
+        self.batch_seconds.observe(time.perf_counter() - started)
 
     def _publish(self, messages: list[Message]) -> None:
         for msg in messages:
+            started = time.perf_counter()
             self.handle_message(msg)
+            self.record_seconds.observe(time.perf_counter() - started)
             # Serve delivery callbacks so the local queue keeps draining.
             self.producer.poll(0)
             # A large batch is progress, not a stall: keep liveness fresh.

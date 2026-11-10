@@ -6,6 +6,7 @@ import pytest
 from safestream_enterprise.connectors.health import (
     ConnectorMetrics,
     HealthServer,
+    Histogram,
     dispatch,
     render_metrics,
 )
@@ -48,7 +49,7 @@ def test_metrics_exposition() -> None:
     ):
         assert line in body.splitlines()
     # every sample has HELP/TYPE metadata and the body ends with a newline
-    assert body.endswith("\n") and body.count("# TYPE") == 8
+    assert body.endswith("\n") and body.count("# TYPE") == 9
 
 
 def test_unknown_routes_and_methods() -> None:
@@ -97,3 +98,18 @@ def test_port_in_use_raises_oserror() -> None:
             HealthServer(lambda: M, port=first.port, liveness_timeout_s=120, host="127.0.0.1")
     finally:
         first.stop()
+
+
+def test_histogram_buckets_are_cumulative_and_lag_is_optional() -> None:
+    h = Histogram((0.1, 1.0))
+    for v in (0.05, 0.1, 0.5, 7.0):
+        h.observe(v)
+    text = render_metrics(M._replace(lag=42, assigned_partitions=3, batch_seconds=h), now=100.0)
+    assert 'safestream_batch_duration_seconds_bucket{le="0.1"} 2' in text
+    assert 'safestream_batch_duration_seconds_bucket{le="1"} 3' in text
+    assert 'safestream_batch_duration_seconds_bucket{le="+Inf"} 4' in text
+    assert "safestream_batch_duration_seconds_count 4" in text
+    assert "safestream_consumer_lag_records 42" in text
+    assert "safestream_assigned_partitions 3" in text
+    # No position yet: the series is absent rather than a misleading zero.
+    assert "safestream_consumer_lag_records" not in render_metrics(M, now=100.0)
