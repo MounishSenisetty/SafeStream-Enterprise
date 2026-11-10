@@ -14,7 +14,7 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      # The builder's Python must match the distroless runtime's (3.11): the
+      # The builder's Python must match the distroless runtime's (3.13): the
       # compiled wheels it installs are ABI-specific. Take digest (security)
       # updates only; move both stages to a new Python together, by hand.
       - dependency-name: python

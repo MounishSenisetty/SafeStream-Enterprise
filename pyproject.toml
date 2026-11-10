@@ -8,6 +8,7 @@ dynamic = ["version"]
 description = "Schema-aware PII & secret redaction for enterprise data pipelines, built on safestream-redactor."
 readme = "README.md"
 license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [{ name = "Mounish Senisetty" }]
 classifiers = [
@@ -30,7 +31,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=7", "mypy>=1.8", "ruff>=0.15,<0.18"]
+dev = ["pytest>=7", "pytest-cov>=5", "mypy>=1.8", "ruff>=0.15,<0.18"]
 
 [project.scripts]
 safestream-kafka = "safestream_enterprise.connectors.kafka:main"

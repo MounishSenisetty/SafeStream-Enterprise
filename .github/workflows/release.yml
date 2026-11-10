@@ -1,5 +1,6 @@
 # Publishes the connector image to GHCR when a version tag (v*) is pushed,
-# for linux/amd64 and linux/arm64, with an SBOM and build provenance attached.
+# for linux/amd64 and linux/arm64, with an SBOM and build provenance attached,
+# and signs it with cosign (keyless: the signature names this workflow).
 # Creating a GitHub Release with a new tag pushes that tag, so both
 # `git push origin v1.2.3` and the Releases UI publish exactly once.
 # Nothing is pushed until the full CI suite (including the real-Kafka and
@@ -22,11 +23,13 @@ jobs:
   image:
     needs: ci
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
+      id-token: write # cosign keyless signing (GitHub OIDC)
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Release tag must match the package version
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
@@ -35,11 +38,11 @@ jobs:
             echo "::error::release tag ${GITHUB_REF_NAME} does not match package version v${version}"
             exit 1
           fi
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       # Smoke-test the image this workflow builds, before anything is pushed.
       - name: Build for smoke test
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true
@@ -56,14 +59,14 @@ jobs:
           docker run --rm --read-only --cap-drop ALL "$img"; code=$?
           set -e
           test "$code" = 2
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         if: startsWith(github.ref, 'refs/tags/v')
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           # Lower-cased by the action: ghcr.io/mounishsenisetty/safestream-enterprise
           images: ghcr.io/${{ github.repository_owner }}/safestream-enterprise
@@ -75,7 +78,8 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-      - uses: docker/build-push-action@v7
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -85,3 +89,12 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           sbom: true
           provenance: mode=max
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        if: startsWith(github.ref, 'refs/tags/v')
+      # By digest, so the signature covers exactly the bytes that were pushed,
+      # under every tag that points at them.
+      - name: Sign the image
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/safestream-enterprise@${DIGEST}"

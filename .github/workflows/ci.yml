@@ -8,6 +8,10 @@ on:
   pull_request:
   workflow_dispatch:
   workflow_call:
+  schedule:
+    # Weekly, so a newly published CVE in a dependency or base image is caught
+    # even when nobody is pushing.
+    - cron: "17 4 * * 1"
 
 permissions:
   contents: read
@@ -20,13 +24,14 @@ jobs:
   checks:
     name: lint, types, unit tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
@@ -35,11 +40,25 @@ jobs:
       - run: ruff format --check .
       - run: mypy
       # Integration tests skip themselves here (no broker).
-      - run: pytest -q
+      - run: pytest -q --cov=safestream_enterprise --cov-fail-under=90
+
+  audit:
+    name: dependency vulnerabilities (pip-audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - run: pip install pip-audit
+      # The lock file is exactly what the image installs.
+      - run: pip-audit -r requirements.txt --require-hashes --disable-pip
 
   integration:
     name: real Kafka + container image
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       kafka:
         # Single-node KRaft broker; advertises PLAINTEXT://localhost:9092.
@@ -51,13 +70,16 @@ jobs:
           --health-timeout 10s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          # The distroless runtime is CPython 3.11; test the same interpreter.
-          python-version: "3.11"
+          # The distroless runtime is CPython 3.13; test the same interpreter.
+          python-version: "3.13"
           cache: pip
-      - run: pip install -e .[dev]
+      # The same hash-locked dependencies the image installs. pip check fails
+      # if requirements.txt has drifted outside the ranges in pyproject.toml.
+      - run: pip install --require-hashes -r requirements.txt
+      - run: pip install --no-deps -e . && pip install pytest && pip check
       - name: build image
         run: docker build -t safestream-enterprise:ci .
       - name: integration tests
@@ -65,13 +87,24 @@ jobs:
           SAFESTREAM_IT_BOOTSTRAP: localhost:9092
           SAFESTREAM_IT_IMAGE: safestream-enterprise:ci
         run: pytest -v -rs tests/test_kafka_integration.py
+      - name: image vulnerability scan (fixable HIGH/CRITICAL fail the build)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: safestream-enterprise:ci
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
 
   manifests:
     name: validate Kubernetes manifests
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: kubeconform (strict schema validation)
         run: >-
           docker run --rm -v "$PWD/deploy:/deploy:ro" ghcr.io/yannh/kubeconform:v0.7.0
-          -strict -summary /deploy/kubernetes/
+          -strict -summary
+          -schema-location default
+          -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          /deploy/kubernetes/
