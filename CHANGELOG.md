@@ -1,0 +1,50 @@
+# Changelog
+
+Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](https://semver.org).
+
+## Unreleased
+
+### Fixed
+- Kafka connector: a record the clean topic rejects for good (`MSG_SIZE_TOO_LARGE`,
+  `INVALID_RECORD`, `INVALID_TIMESTAMP`) is now dead-lettered. Before, the connector exited and
+  replayed the same record on every restart, in both delivery modes.
+- An unknown `LOG_LEVEL` falls back to `INFO` with a warning instead of a traceback.
+
+### Added
+- `LOG_FORMAT=json` for the connector and `safestream-batch`.
+- Kubernetes: Namespace enforcing the `restricted` Pod Security Standard, PodDisruptionBudget,
+  topology spread across nodes and zones, an explicit rolling-update strategy, and
+  Prometheus alert rules (`deploy/kubernetes/prometheus-rules.yaml`).
+- `requirements.txt`: hash-pinned lock file; the image installs from it with `--require-hashes`.
+- CI: pip-audit on the lock file, a Trivy scan of the image, a 90% coverage floor, a weekly
+  scheduled run. Release images are signed with cosign.
+- `LICENSE`, `SECURITY.md`, `CODEOWNERS` and this changelog.
+
+### Changed
+- The image moves to Debian 13 and CPython 3.13 (distroless `python3-debian13`). The Debian 12
+  runtime image is no longer patched upstream and carried fixable high and critical CVEs.
+- GitHub Actions are pinned to commit SHAs.
+
+## 0.3.0 - 2026-11-06
+
+- IBAN fields are redacted as the `iban` entity type.
+
+## 0.2.1 - 2026-11-06
+
+- Moves to safestream-redactor 0.5.
+- Keys in the style of `patient_mrn` are redacted.
+
+## 0.2.0 - 2026-11-05
+
+- Custom field rules from a JSON file or ConfigMap.
+- Health probes (`/healthz`, `/readyz`) and Prometheus metrics for the Kafka connector.
+- Content-free compliance audit events.
+- `safestream-batch`: backfill files, directory trees or stdin in constant memory.
+
+## 0.1.0 - 2026-11-04
+
+- Structure-aware JSON and XML redaction on top of safestream-redactor.
+- Kafka connector with at-least-once and exactly-once delivery and a dead-letter topic.
+- Distroless, non-root image with base images pinned by digest; Kubernetes manifest with a
+  default-deny NetworkPolicy.
+- CI with real-broker integration tests; release workflow publishing to GHCR.

@@ -117,7 +117,11 @@ evidence without creating a new sensitive artifact. See
 **Kubernetes (recommended):**
 
 ```bash
-kubectl create secret generic safestream-secrets \
+kubectl create namespace safestream
+```
+
+```bash
+kubectl -n safestream create secret generic safestream-secrets \
   --from-literal=hmac-key="$(openssl rand -hex 32)" \
   --from-literal=sasl-username=svc-safestream --from-literal=sasl-password='...'
 ```
@@ -127,6 +131,14 @@ kubectl apply -f deploy/kubernetes/kafka-redactor.yaml
 ```
 
 Point your data-lake sinks at `egress-logs-clean`. Producers do not need any changes.
+
+The manifest runs three replicas spread across nodes and zones, with a PodDisruptionBudget so
+node drains take one at a time, in a namespace that enforces the `restricted` Pod Security
+Standard. With the Prometheus Operator, also apply the alert rules:
+
+```bash
+kubectl apply -f deploy/kubernetes/prometheus-rules.yaml
+```
 
 **Docker:**
 
@@ -204,6 +216,8 @@ with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
 | `SAFESTREAM_BATCH_SIZE` | `500` | Records per commit (per transaction in exactly-once mode) |
 | `SAFESTREAM_FLUSH_TIMEOUT_S` | `30` | Maximum wait for egress acknowledgements per batch |
 | `SAFESTREAM_KAFKA_*` | none | Any Kafka client setting, e.g. `SAFESTREAM_KAFKA_SECURITY_PROTOCOL=SASL_SSL` |
+| `LOG_LEVEL` | `INFO` | Standard level name; an unknown name falls back to `INFO` |
+| `LOG_FORMAT` | `text` | `text`, or `json` for one JSON object per line. Also applies to `safestream-batch` |
 
 Configuration is validated at startup. A bad value, or a dangerous combination such as the
 DLQ topic set to the clean topic, stops the pod immediately with a clear error. Secret values
@@ -307,8 +321,9 @@ Kubernetes manifest wires them up as probes and for Prometheus scraping.
 | `safestream_heartbeat_age_seconds` | gauge | Seconds since the main loop last advanced |
 | `safestream_ready` | gauge | 1 while consuming |
 
-Useful alerts include a rising `dlq` rate (producers sending malformed records) and
-`transaction_aborts_total` increasing. Consumer lag comes from your usual Kafka exporter,
+Ready-made alerts for these metrics are in `deploy/kubernetes/prometheus-rules.yaml`: no
+replica consuming, a stalled main loop, a sustained `dlq` rate (producers sending malformed
+records), repeated transaction aborts, and undelivered audit events. Consumer lag comes from your usual Kafka exporter,
 for example kafka-exporter or Burrow, under group `KAFKA_GROUP_ID`.
 
 The endpoint carries counts only, never record content, keys or headers, and it never logs
@@ -320,6 +335,11 @@ requests. The NetworkPolicy lets only the `monitoring` namespace reach the port.
   DLQ while the consumer keeps running. If the brokers fail to acknowledge a batch, the
   consumer exits without committing offsets, and Kubernetes restarts it from the last safe
   point. In none of these cases does an unredacted record reach the clean topic.
+- **No poison pills.** A record the clean topic itself rejects for good (too large once
+  redacted, or a timestamp the topic refuses) would fail again on every replay. Its original
+  goes to the DLQ instead, tagged with the broker's error name (for example
+  `MSG_SIZE_TOO_LARGE`), and the consumer moves on. Records the broker rejected in the same
+  produce batch go with it. Transient failures are never dead-lettered.
 - **Hostile XML is refused.** Any XML document with a DTD is treated as malformed, which
   blocks entity-expansion bombs and external-entity (XXE) file reads and requests, in every
   encoding. Nesting depth is capped at 254 levels for both JSON and XML.
@@ -332,18 +352,26 @@ requests. The NetworkPolicy lets only the `monitoring` namespace reach the port.
   default-deny NetworkPolicy allows egress only to the Kafka brokers (port 9092) and DNS, and
   ingress only from the `monitoring` namespace to the metrics port.
 - **No plugin code by default.** Third-party detector plugins are disabled in the service.
+- **Verifiable supply chain.** The image installs its Python dependencies from a lock file
+  (`requirements.txt`) that pins every version and checks every wheel's hash. CI audits the
+  lock file for known vulnerabilities and scans the built image, on every change and weekly.
+  GitHub Actions are pinned to commit SHAs. Release images carry an SBOM and build provenance
+  and are signed with cosign; see [Verifying a release](#verifying-a-release).
 
 ## Repository layout
 
 ```
 SafeStream-Enterprise/
 ├── pyproject.toml                      # depends on safestream-redactor (OSS core)
+├── requirements.txt                    # hash-pinned lock file the image installs from
 ├── Dockerfile                          # distroless, non-root connector image
 ├── deploy/
 │   └── kubernetes/
-│       └── kafka-redactor.yaml         # Deployment + default-deny NetworkPolicy
+│       ├── kafka-redactor.yaml         # Namespace, Deployment, PDB, default-deny NetworkPolicy
+│       └── prometheus-rules.yaml       # alerts (Prometheus Operator)
 ├── src/safestream_enterprise/
 │   ├── batch.py                        # safestream-batch: backfill files / stdin
+│   ├── logs.py                         # LOG_LEVEL / LOG_FORMAT for both entry points
 │   ├── rules.py                        # custom field rules + the shared redactor factory
 │   ├── parsers/
 │   │   ├── json_ast.py                 # structure-aware JSON/NDJSON redaction (entry point)
@@ -384,16 +412,41 @@ service container:
 SAFESTREAM_IT_BOOTSTRAP=localhost:9092 SAFESTREAM_IT_IMAGE=safestream-enterprise:ci pytest tests/test_kafka_integration.py
 ```
 
+After changing dependencies in `pyproject.toml`, regenerate the lock file the image installs
+from (Dependabot keeps the pins in it current otherwise):
+
+```bash
+uv pip compile pyproject.toml --generate-hashes --python-version 3.13 -o requirements.txt
+```
+
 ### Releasing
 
-Bump `__version__` in `src/safestream_enterprise/__init__.py`, merge, then push a tag
+Bump `__version__` in `src/safestream_enterprise/__init__.py` and the image tag in the
+manifest, move the `Unreleased` entries in `CHANGELOG.md` under the new version, merge, then push a tag
 `v<version>`, or create a GitHub Release with that new tag, which pushes it. The release
 workflow:
 
 1. runs the full CI suite on the release commit, including the real-Kafka and container tests;
 2. refuses a tag that doesn't match the package version;
 3. smoke-tests the image, then pushes `ghcr.io/mounishsenisetty/safestream-enterprise:<version>`
-   (and `:<major>.<minor>`) for linux/amd64 and linux/arm64, with an SBOM and build provenance.
+   (and `:<major>.<minor>`) for linux/amd64 and linux/arm64, with an SBOM and build provenance;
+4. signs the pushed image digest with cosign.
 
 Base images are pinned by digest, and Dependabot proposes digest, dependency and action updates
 weekly.
+
+### Verifying a release
+
+Images released after 0.3.0 are signed by the release workflow's GitHub identity; there is no key to
+distribute. Verify before deploying, or enforce it in the cluster with an admission policy:
+
+```bash
+cosign verify ghcr.io/mounishsenisetty/safestream-enterprise:<version> \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github.com/MounishSenisetty/SafeStream-Enterprise/\.github/workflows/release\.yml@refs/tags/v'
+```
+
+## Security
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md). Changes are listed in
+[CHANGELOG.md](CHANGELOG.md).
