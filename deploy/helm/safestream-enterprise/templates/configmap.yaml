@@ -1,0 +1,13 @@
+# Customer field rules, added to the built-in PCI/HIPAA/GDPR rules. They are
+# read once at startup and validated: a bad file stops the pod with a clear
+# error instead of leaving a field unredacted.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "safestream.name" . }}-field-rules
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "safestream.labels" . | nindent 4 }}
+data:
+  field-rules.json: |
+    {{- .Values.fieldRules | trim | nindent 4 }}

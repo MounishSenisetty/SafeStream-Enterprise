@@ -1,0 +1,12 @@
+{{- if .Values.namespace.create }}
+# The namespace enforces the "restricted" Pod Security Standard: a pod that is
+# root, privileged or missing the hardening below is rejected at admission.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+{{- end }}

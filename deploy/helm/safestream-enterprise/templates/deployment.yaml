@@ -1,0 +1,166 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "safestream.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "safestream.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  # One pod at a time, and no surge pod: an extra consumer-group member would
+  # only add a rebalance (and sits idle beyond the partition count).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  selector:
+    matchLabels:
+      {{- include "safestream.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "safestream.selectorLabels" . | nindent 8 }}
+      annotations:
+        # Rules are read once at startup: a change must roll the pods.
+        checksum/field-rules: {{ .Values.fieldRules | sha256sum }}
+        {{- if .Values.metrics.scrapeAnnotations }}
+        # /metrics carries counts, never content.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.metrics.port | quote }}
+        prometheus.io/path: /metrics
+        {{- end }}
+    spec:
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      # The connector never talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread replicas over nodes and zones so one failure takes out one
+      # consumer, not the group. Best-effort: a small cluster still schedules.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "safestream.selectorLabels" . | nindent 14 }}
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "safestream.selectorLabels" . | nindent 14 }}
+      containers:
+        - name: redactor
+          image: {{ include "safestream.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metrics.port }}
+              protocol: TCP
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: {{ .Values.kafka.bootstrapServers | quote }}
+            - name: KAFKA_GROUP_ID
+              value: {{ .Values.kafka.groupId | quote }}
+            - name: INGRESS_TOPIC
+              value: {{ .Values.kafka.ingressTopic | quote }}
+            - name: EGRESS_TOPIC
+              value: {{ .Values.kafka.egressTopic | quote }}
+            - name: DLQ_TOPIC
+              value: {{ .Values.kafka.dlqTopic | quote }}
+            - name: SAFESTREAM_UNPARSEABLE
+              value: {{ .Values.redaction.unparseable | quote }}
+            - name: SAFESTREAM_DELIVERY
+              value: {{ .Values.redaction.delivery | quote }}
+            - name: SAFESTREAM_FIELD_RULES_FILE
+              value: /etc/safestream/field-rules.json
+            {{- if .Values.audit.topic }}
+            - name: SAFESTREAM_AUDIT_TOPIC
+              value: {{ .Values.audit.topic | quote }}
+            - name: SAFESTREAM_AUDIT_INTERVAL_S
+              value: {{ .Values.audit.intervalSeconds | quote }}
+            {{- end }}
+            - name: SAFESTREAM_MODE
+              value: {{ .Values.redaction.mode | quote }}
+            {{- if eq .Values.redaction.mode "pseudonymize" }}
+            - name: SAFESTREAM_HMAC_KEY
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.existingSecret }}, key: hmac-key }
+            {{- end }}
+            - name: SAFESTREAM_METRICS_PORT
+              value: {{ .Values.metrics.port | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logging.level | quote }}
+            - name: LOG_FORMAT
+              value: {{ .Values.logging.format | quote }}
+            - name: SAFESTREAM_KAFKA_SECURITY_PROTOCOL
+              value: {{ .Values.kafka.securityProtocol | quote }}
+            {{- if .Values.kafka.sasl.enabled }}
+            - name: SAFESTREAM_KAFKA_SASL_MECHANISM
+              value: {{ .Values.kafka.sasl.mechanism | quote }}
+            - name: SAFESTREAM_KAFKA_SASL_USERNAME
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.existingSecret }}, key: sasl-username }
+            - name: SAFESTREAM_KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.existingSecret }}, key: sasl-password }
+            {{- end }}
+            {{- range $property, $value := .Values.kafka.extraProperties }}
+            - name: SAFESTREAM_KAFKA_{{ $property | upper | replace "." "_" }}
+              value: {{ $value | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # /healthz fails only when the main loop stops advancing (a wedged
+          # process), never because the brokers are down: a restart cannot fix
+          # the brokers. SAFESTREAM_LIVENESS_TIMEOUT_S (default 120s) bounds it.
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: metrics }
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: field-rules
+              mountPath: /etc/safestream
+              readOnly: true
+      volumes:
+        - name: field-rules
+          configMap:
+            name: {{ include "safestream.name" . }}-field-rules
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

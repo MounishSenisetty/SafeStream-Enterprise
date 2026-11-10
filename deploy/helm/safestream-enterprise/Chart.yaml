@@ -1,0 +1,8 @@
+apiVersion: v2
+name: safestream-enterprise
+description: SafeStream Enterprise Kafka redaction connector
+type: application
+# Chart and application are released together.
+version: 0.3.0
+appVersion: "0.3.0"
+kubeVersion: ">=1.25.0-0"

@@ -30,7 +30,7 @@ from confluent_kafka.admin import (
     NewTopic,
 )
 
-from safestream_enterprise import DEFAULT_FIELD_RULES
+from safestream_enterprise import DEFAULT_FIELD_RULES, dlq
 from safestream_enterprise.connectors.kafka import (
     ConnectorConfig,
     DeliveryError,
@@ -270,6 +270,58 @@ def test_record_the_egress_topic_rejects_is_dead_lettered(
     assert [m.value() for m in dead] == [big]  # the original, for replay after a fix
     assert dict(dead[0].headers() or [])["x-safestream-error"] == b"MSG_SIZE_TOO_LARGE"
     assert committed_lag(group, topics["ingress"]) == 0
+
+
+def test_dlq_summary_and_replay_through_redaction(topics: dict[str, str]) -> None:
+    group = f"it-connector-{uuid.uuid4().hex[:8]}"
+
+    def config(unparseable: str) -> ConnectorConfig:
+        return ConnectorConfig(
+            bootstrap_servers=BOOTSTRAP,
+            group_id=group,
+            ingress_topic=topics["ingress"],
+            egress_topic=topics["egress"],
+            dlq_topic=topics["dlq"],
+            delivery="exactly_once",  # DLQ records sit behind transaction markers
+            unparseable=unparseable,  # type: ignore[arg-type]
+            poll_timeout_s=0.5,
+            metrics_port=0,
+        )
+
+    def dlq_tool(replay: bool, replay_group: str = "a", **kw: object) -> dict[str, object]:
+        cfg = config("dlq")
+        consumer = Consumer(dlq.consumer_config(cfg, f"{group}-replay-{replay_group}"))
+        producer = Producer({"bootstrap.servers": BOOTSTRAP}) if replay else None
+        try:
+            return dlq.run(cfg, consumer, producer, **kw)  # type: ignore[arg-type]
+        finally:
+            consumer.close()
+
+    text = [b"not json: mail alice@corp.example", b"not json: mail carol@corp.example"]
+    with Running(config("dlq")):
+        produce(topics["ingress"], [(b"k", v) for v in text])
+        assert len(drain(topics["dlq"], expected=2)) == 2
+
+    assert dlq_tool(replay=False) == {
+        "topic": topics["dlq"],
+        "records": 2,
+        "by_error": {"StructuredParseError": 2},
+    }
+    # A filter that matches nothing replays nothing (and, for this group, passes over both).
+    assert dlq_tool(replay=True, error="MSG_SIZE_TOO_LARGE", limit=None)["replayed"] == 0
+
+    # "Fix the cause" (accept free text), then replay under a fresh replay group.
+    with Running(config("redact_text")):
+        first = dlq_tool(replay=True, replay_group="b")
+        assert (first["replayed"], first["skipped"]) == (2, 0)
+        clean = drain(topics["egress"], expected=2)
+    assert sorted(m.value() or b"" for m in clean) == [
+        b"not json: mail [REDACTED]",
+        b"not json: mail [REDACTED]",
+    ]
+    # No error tag carried back in, and a second run has nothing left to do.
+    assert all("x-safestream-error" not in dict(m.headers() or []) for m in clean)
+    assert dlq_tool(replay=True, replay_group="b")["replayed"] == 0
 
 
 @pytest.mark.skipif(not KAFKA_CONTAINER, reason="SAFESTREAM_IT_KAFKA_CONTAINER not set")

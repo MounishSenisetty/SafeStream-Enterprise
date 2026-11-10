@@ -1,0 +1,13 @@
+{{- if .Values.dashboard.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "safestream.name" . }}-dashboard
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "safestream.labels" . | nindent 4 }}
+    {{- toYaml .Values.dashboard.labels | nindent 4 }}
+data:
+  safestream.json: |
+    {{- .Files.Get "dashboards/safestream.json" | nindent 4 }}
+{{- end }}

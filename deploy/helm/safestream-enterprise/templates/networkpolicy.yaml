@@ -1,0 +1,52 @@
+{{- if .Values.networkPolicy.enabled }}
+# Default-deny for the connector pods. Selecting a pod with both policy types
+# denies all ingress and all egress not explicitly allowed below, so the only
+# reachable destinations are the Kafka brokers and cluster DNS.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "safestream.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "safestream.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "safestream.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+  # Ingress: only Prometheus may connect, and only to the metrics port.
+  # Kubelet health probes come from the node and are allowed by the CNIs in
+  # common use; if yours filters host traffic, allow the node CIDR on the port.
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.monitoringNamespace }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.metrics.port }} }
+  egress:
+    # Kafka brokers only: namespace AND pod label must both match (same list item).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.kafka.namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.kafka.podLabels | nindent 14 }}
+      ports:
+        - { protocol: TCP, port: {{ .Values.networkPolicy.kafka.port }} }
+    # Cluster DNS only.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - { protocol: UDP, port: 53 }
+        - { protocol: TCP, port: 53 }
+    {{- with .Values.networkPolicy.extraEgress }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+{{- end }}

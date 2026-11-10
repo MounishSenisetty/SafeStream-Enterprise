@@ -1,8 +1,5 @@
-# SafeStream Enterprise: Kafka redaction connector.
-#
-# Consumes ingress-logs, publishes egress-logs-clean, routes unprocessable
-# records to ingress-logs-dlq. Replicas share one consumer group: scale up to
-# the ingress topic's partition count (extra replicas sit idle).
+# Rendered from deploy/helm/safestream-enterprise by deploy/render.sh. Do not edit:
+# change the chart (or its values) and render again.
 #
 #   kubectl create namespace safestream   # first, so the Secret has somewhere to go
 #   kubectl -n safestream create secret generic safestream-secrets \
@@ -12,9 +9,10 @@
 #   kubectl apply -f deploy/kubernetes/kafka-redactor.yaml
 #
 # Assumes the brokers run in namespace "kafka" with pod label
-# app.kubernetes.io/name=kafka, listening on 9092. Adjust the NetworkPolicy
-# selectors to match your cluster (e.g. strimzi.io/cluster for Strimzi).
+# app.kubernetes.io/name=kafka, listening on 9092 with SASL_SSL. For anything
+# else, install the chart with your own values instead.
 ---
+# Source: safestream-enterprise/templates/namespace.yaml
 # The namespace enforces the "restricted" Pod Security Standard: a pod that is
 # root, privileged or missing the hardening below is rejected at admission.
 apiVersion: v1
@@ -26,191 +24,18 @@ metadata:
     pod-security.kubernetes.io/audit: restricted
     pod-security.kubernetes.io/warn: restricted
 ---
-# Customer field rules, added to the built-in PCI/HIPAA/GDPR rules (see
-# "Custom field rules" in the README for the format). They are read once at
-# startup and validated: a bad file stops the pod with a clear error instead of
-# leaving a field unredacted. After editing, roll the pods so every replica
-# uses the same rules:
-#   kubectl -n safestream rollout restart deployment/safestream-kafka-redactor
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: safestream-field-rules
-  namespace: safestream
-data:
-  field-rules.json: |
-    {
-      "mode": "extend",
-      "rules": {
-        "*loyalty_number*": "id_number",
-        "*member_id*": "id_number"
-      },
-      "disable": []
-    }
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: safestream-kafka-redactor
-  namespace: safestream
-  labels:
-    app.kubernetes.io/name: safestream-kafka-redactor
-spec:
-  replicas: 3
-  # One pod at a time, and no surge pod: an extra consumer-group member would
-  # only add a rebalance (and sits idle beyond the partition count).
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 1
-      maxSurge: 0
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: safestream-kafka-redactor
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: safestream-kafka-redactor
-      annotations:
-        # Annotation-based discovery; with the Prometheus Operator use a PodMonitor
-        # on the "metrics" port instead. /metrics carries counts, never content.
-        prometheus.io/scrape: "true"
-        prometheus.io/port: "9400"
-        prometheus.io/path: /metrics
-    spec:
-      # Time to finish the in-flight batch, wait for egress acks and commit
-      # after SIGTERM. Must exceed SAFESTREAM_FLUSH_TIMEOUT_S.
-      terminationGracePeriodSeconds: 60
-      # The connector never talks to the Kubernetes API.
-      automountServiceAccountToken: false
-      # Spread replicas over nodes and zones so one failure takes out one
-      # consumer, not the group. Best-effort: a small cluster still schedules.
-      topologySpreadConstraints:
-        - maxSkew: 1
-          topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: safestream-kafka-redactor
-        - maxSkew: 1
-          topologyKey: topology.kubernetes.io/zone
-          whenUnsatisfiable: ScheduleAnyway
-          labelSelector:
-            matchLabels:
-              app.kubernetes.io/name: safestream-kafka-redactor
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 65532
-        runAsGroup: 65532
-        seccompProfile:
-          type: RuntimeDefault
-      containers:
-        - name: redactor
-          image: ghcr.io/mounishsenisetty/safestream-enterprise:0.3.0
-          imagePullPolicy: IfNotPresent
-          ports:
-            - name: metrics
-              containerPort: 9400
-              protocol: TCP
-          env:
-            - name: KAFKA_BOOTSTRAP_SERVERS
-              value: "kafka-bootstrap.kafka.svc.cluster.local:9092"
-            - name: KAFKA_GROUP_ID
-              value: "safestream-redactor"
-            - name: INGRESS_TOPIC
-              value: "ingress-logs"
-            - name: EGRESS_TOPIC
-              value: "egress-logs-clean"
-            - name: DLQ_TOPIC
-              value: "ingress-logs-dlq"
-            # Payloads that are neither JSON nor XML. dlq: send them to the DLQ;
-            # redact_text: text-redact them and deliver them to egress.
-            - name: SAFESTREAM_UNPARSEABLE
-              value: "dlq"
-            # at_least_once, or exactly_once: one Kafka transaction per batch. Exactly-once
-            # needs a TransactionalId ACL (Write, Describe) for "safestream-redactor-*",
-            # and clean-topic consumers must read with isolation.level=read_committed.
-            - name: SAFESTREAM_DELIVERY
-              value: "at_least_once"
-            - name: SAFESTREAM_FIELD_RULES_FILE
-              value: "/etc/safestream/field-rules.json"
-            # Compliance audit events: one content-free JSON event per window
-            # (counts, modes, field-rule fingerprint) to this topic. Create it first
-            # with long retention and grant this service Write on it, then uncomment.
-            # - name: SAFESTREAM_AUDIT_TOPIC
-            #   value: "safestream-audit"
-            # - name: SAFESTREAM_AUDIT_INTERVAL_S
-            #   value: "60"
-            - name: SAFESTREAM_MODE
-              value: "pseudonymize"
-            - name: SAFESTREAM_HMAC_KEY
-              valueFrom:
-                secretKeyRef: { name: safestream-secrets, key: hmac-key }
-            # Any librdkafka property: SAFESTREAM_KAFKA_<PROPERTY, dots as underscores>.
-            # Set the protocol to match the 9092 listener (PLAINTEXT, SSL, SASL_SSL).
-            - name: SAFESTREAM_KAFKA_SECURITY_PROTOCOL
-              value: "SASL_SSL"
-            - name: SAFESTREAM_KAFKA_SASL_MECHANISM
-              value: "SCRAM-SHA-512"
-            - name: SAFESTREAM_KAFKA_SASL_USERNAME
-              valueFrom:
-                secretKeyRef: { name: safestream-secrets, key: sasl-username }
-            - name: SAFESTREAM_KAFKA_SASL_PASSWORD
-              valueFrom:
-                secretKeyRef: { name: safestream-secrets, key: sasl-password }
-          # /healthz fails only when the main loop stops advancing (a wedged
-          # process), never because the brokers are down: a restart cannot fix
-          # the brokers. SAFESTREAM_LIVENESS_TIMEOUT_S (default 120s) bounds it.
-          livenessProbe:
-            httpGet: { path: /healthz, port: metrics }
-            initialDelaySeconds: 10
-            periodSeconds: 15
-            failureThreshold: 3
-          readinessProbe:
-            httpGet: { path: /readyz, port: metrics }
-            periodSeconds: 10
-          resources:
-            # Memory is flat: one batch of records at a time, regardless of topic volume.
-            requests: { cpu: "500m", memory: "256Mi" }
-            limits: { cpu: "2", memory: "512Mi" }
-          securityContext:
-            runAsNonRoot: true
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            privileged: false
-            capabilities:
-              drop: ["ALL"]
-          volumeMounts:
-            - name: field-rules
-              mountPath: /etc/safestream
-              readOnly: true
-      volumes:
-        - name: field-rules
-          configMap:
-            name: safestream-field-rules
----
-# Node drains and cluster upgrades evict at most one replica at a time.
-apiVersion: policy/v1
-kind: PodDisruptionBudget
-metadata:
-  name: safestream-kafka-redactor
-  namespace: safestream
-spec:
-  maxUnavailable: 1
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: safestream-kafka-redactor
----
+# Source: safestream-enterprise/templates/networkpolicy.yaml
 # Default-deny for the connector pods. Selecting a pod with both policy types
 # denies all ingress and all egress not explicitly allowed below, so the only
-# reachable destinations are the Kafka brokers on 9092 and cluster DNS. This is
-# the network boundary the OSS in-process guard can't provide here, because
-# the connector has to reach Kafka.
+# reachable destinations are the Kafka brokers and cluster DNS.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: safestream-kafka-redactor
   namespace: safestream
+  labels:
+    app.kubernetes.io/name: safestream-kafka-redactor
+    app.kubernetes.io/version: "0.3.0"
 spec:
   podSelector:
     matchLabels:
@@ -218,7 +43,7 @@ spec:
   policyTypes: [Ingress, Egress]
   # Ingress: only Prometheus may connect, and only to the metrics port.
   # Kubelet health probes come from the node and are allowed by the CNIs in
-  # common use; if yours filters host traffic, allow the node CIDR on 9400.
+  # common use; if yours filters host traffic, allow the node CIDR on the port.
   ingress:
     - from:
         - namespaceSelector:
@@ -248,3 +73,179 @@ spec:
       ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
+---
+# Source: safestream-enterprise/templates/pdb.yaml
+# Node drains and cluster upgrades evict at most this many replicas at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: safestream-kafka-redactor
+  namespace: safestream
+  labels:
+    app.kubernetes.io/name: safestream-kafka-redactor
+    app.kubernetes.io/version: "0.3.0"
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: safestream-kafka-redactor
+---
+# Source: safestream-enterprise/templates/configmap.yaml
+# Customer field rules, added to the built-in PCI/HIPAA/GDPR rules. They are
+# read once at startup and validated: a bad file stops the pod with a clear
+# error instead of leaving a field unredacted.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: safestream-kafka-redactor-field-rules
+  namespace: safestream
+  labels:
+    app.kubernetes.io/name: safestream-kafka-redactor
+    app.kubernetes.io/version: "0.3.0"
+data:
+  field-rules.json: |
+    {
+      "mode": "extend",
+      "rules": {
+        "*loyalty_number*": "id_number",
+        "*member_id*": "id_number"
+      },
+      "disable": []
+    }
+---
+# Source: safestream-enterprise/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: safestream-kafka-redactor
+  namespace: safestream
+  labels:
+    app.kubernetes.io/name: safestream-kafka-redactor
+    app.kubernetes.io/version: "0.3.0"
+spec:
+  replicas: 3
+  # One pod at a time, and no surge pod: an extra consumer-group member would
+  # only add a rebalance (and sits idle beyond the partition count).
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 0
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: safestream-kafka-redactor
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: safestream-kafka-redactor
+      annotations:
+        # Rules are read once at startup: a change must roll the pods.
+        checksum/field-rules: ccc28084f8e9ca1461ab6364f9152acca1731886cdc5565fb511c27386389340
+        # /metrics carries counts, never content.
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9400"
+        prometheus.io/path: /metrics
+    spec:
+      terminationGracePeriodSeconds: 60
+      # The connector never talks to the Kubernetes API.
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # Spread replicas over nodes and zones so one failure takes out one
+      # consumer, not the group. Best-effort: a small cluster still schedules.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: safestream-kafka-redactor
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: safestream-kafka-redactor
+      containers:
+        - name: redactor
+          image: ghcr.io/mounishsenisetty/safestream-enterprise:0.3.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: metrics
+              containerPort: 9400
+              protocol: TCP
+          env:
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              value: "kafka-bootstrap.kafka.svc.cluster.local:9092"
+            - name: KAFKA_GROUP_ID
+              value: "safestream-redactor"
+            - name: INGRESS_TOPIC
+              value: "ingress-logs"
+            - name: EGRESS_TOPIC
+              value: "egress-logs-clean"
+            - name: DLQ_TOPIC
+              value: "ingress-logs-dlq"
+            - name: SAFESTREAM_UNPARSEABLE
+              value: "dlq"
+            - name: SAFESTREAM_DELIVERY
+              value: "at_least_once"
+            - name: SAFESTREAM_FIELD_RULES_FILE
+              value: /etc/safestream/field-rules.json
+            - name: SAFESTREAM_MODE
+              value: "pseudonymize"
+            - name: SAFESTREAM_HMAC_KEY
+              valueFrom:
+                secretKeyRef: { name: safestream-secrets, key: hmac-key }
+            - name: SAFESTREAM_METRICS_PORT
+              value: "9400"
+            - name: LOG_LEVEL
+              value: "INFO"
+            - name: LOG_FORMAT
+              value: "text"
+            - name: SAFESTREAM_KAFKA_SECURITY_PROTOCOL
+              value: "SASL_SSL"
+            - name: SAFESTREAM_KAFKA_SASL_MECHANISM
+              value: "SCRAM-SHA-512"
+            - name: SAFESTREAM_KAFKA_SASL_USERNAME
+              valueFrom:
+                secretKeyRef: { name: safestream-secrets, key: sasl-username }
+            - name: SAFESTREAM_KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: safestream-secrets, key: sasl-password }
+          # /healthz fails only when the main loop stops advancing (a wedged
+          # process), never because the brokers are down: a restart cannot fix
+          # the brokers. SAFESTREAM_LIVENESS_TIMEOUT_S (default 120s) bounds it.
+          livenessProbe:
+            httpGet: { path: /healthz, port: metrics }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: metrics }
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: "2"
+              memory: 512Mi
+            requests:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: field-rules
+              mountPath: /etc/safestream
+              readOnly: true
+      volumes:
+        - name: field-rules
+          configMap:
+            name: safestream-kafka-redactor-field-rules

@@ -1,0 +1,15 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+# Node drains and cluster upgrades evict at most this many replicas at a time.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "safestream.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "safestream.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "safestream.selectorLabels" . | nindent 6 }}
+{{- end }}

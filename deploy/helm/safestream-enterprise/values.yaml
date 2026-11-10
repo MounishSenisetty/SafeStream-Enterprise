@@ -1,0 +1,142 @@
+# SafeStream Enterprise Kafka connector. Every value here has a row in the
+# README's configuration table; only the Kubernetes wiring is specific to the chart.
+
+image:
+  repository: ghcr.io/mounishsenisetty/safestream-enterprise
+  # Defaults to the chart's appVersion. Pin a digest in production: "0.3.0@sha256:...".
+  tag: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+
+# Resource names. Changing it lets two connectors share a namespace.
+fullnameOverride: safestream-kafka-redactor
+
+# Replicas share one consumer group: useful up to the ingress topic's partition
+# count (extra replicas sit idle). Ignored when autoscaling.enabled.
+replicaCount: 3
+
+kafka:
+  bootstrapServers: kafka-bootstrap.kafka.svc.cluster.local:9092
+  groupId: safestream-redactor
+  ingressTopic: ingress-logs
+  egressTopic: egress-logs-clean
+  # Holds original, unredacted records: restrict its ACLs like the ingress topic.
+  dlqTopic: ingress-logs-dlq
+  # PLAINTEXT, SSL, SASL_PLAINTEXT or SASL_SSL; must match the broker listener.
+  securityProtocol: SASL_SSL
+  sasl:
+    # Reads sasl-username and sasl-password from the Secret below.
+    enabled: true
+    mechanism: SCRAM-SHA-512
+  # Any other librdkafka property, e.g. {"ssl.ca.location": "/etc/ssl/kafka/ca.crt"}.
+  extraProperties: {}
+
+redaction:
+  # replace, mask or pseudonymize (pseudonymize needs hmac-key in the Secret).
+  mode: pseudonymize
+  # Payloads that are neither JSON nor XML. dlq: send them to the DLQ;
+  # redact_text: text-redact them and deliver them to egress.
+  unparseable: dlq
+  # at_least_once, or exactly_once: one Kafka transaction per batch. Exactly-once
+  # needs a TransactionalId ACL (Write, Describe) for "<groupId>-*", and
+  # clean-topic consumers must read with isolation.level=read_committed.
+  delivery: at_least_once
+
+# Secret you create beforehand, with keys hmac-key, sasl-username, sasl-password:
+#   kubectl -n <namespace> create secret generic safestream-secrets \
+#     --from-literal=hmac-key="$(openssl rand -hex 32)" \
+#     --from-literal=sasl-username=svc-safestream --from-literal=sasl-password='...'
+existingSecret: safestream-secrets
+
+# Customer field rules, added to the built-in PCI/HIPAA/GDPR rules (see "Custom
+# field rules" in the README). Validated at startup: a bad rule stops the pod
+# with a clear error instead of leaving a field unredacted. Changing them rolls
+# the pods, so every replica uses the same rules.
+# JSON text, not YAML: rules are matched in the order written, first match wins,
+# and Helm does not keep the order of YAML maps.
+fieldRules: |
+  {
+    "mode": "extend",
+    "rules": {
+      "*loyalty_number*": "id_number",
+      "*member_id*": "id_number"
+    },
+    "disable": []
+  }
+
+# Compliance audit events: one content-free JSON event per window. Create the
+# topic first, with long retention, and grant this service Write on it.
+audit:
+  topic: ""
+  intervalSeconds: 60
+
+logging:
+  level: INFO
+  # text or json
+  format: text
+
+metrics:
+  port: 9400
+  # Annotation-based discovery; with the Prometheus Operator use a PodMonitor instead.
+  scrapeAnnotations: true
+
+# Extra container environment (any SAFESTREAM_* setting not covered above).
+extraEnv: []
+
+resources:
+  # Memory is flat: one batch of records at a time, regardless of topic volume.
+  requests: { cpu: 500m, memory: 256Mi }
+  limits: { cpu: "2", memory: 512Mi }
+
+# Time to finish the in-flight batch, wait for egress acks and commit after
+# SIGTERM. Must exceed SAFESTREAM_FLUSH_TIMEOUT_S (30s by default).
+terminationGracePeriodSeconds: 60
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# Default-deny for the connector pods: egress only to the brokers and cluster
+# DNS, ingress only from the monitoring namespace to the metrics port.
+networkPolicy:
+  enabled: true
+  kafka:
+    namespace: kafka
+    # Adjust to your brokers' labels (e.g. strimzi.io/cluster: my-cluster).
+    podLabels:
+      app.kubernetes.io/name: kafka
+    port: 9092
+  monitoringNamespace: monitoring
+  # Further egress rules, e.g. an ipBlock for brokers outside the cluster.
+  extraEgress: []
+
+# Scale on consumer lag with KEDA (https://keda.sh), which must be installed.
+# KEDA reads lag from the brokers itself, with the same Secret.
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  # Keep at or below the ingress topic's partition count.
+  maxReplicas: 12
+  # Target lag per replica. One replica clears about 2,000 small records/s
+  # (docs/benchmarks.md), so 60000 is roughly 30 seconds of backlog.
+  lagThreshold: 60000
+
+# Alerts, for the Prometheus Operator.
+prometheusRule:
+  enabled: false
+  labels: {}
+
+# Grafana dashboard as a ConfigMap, for Grafana's dashboard sidecar.
+dashboard:
+  enabled: false
+  labels:
+    grafana_dashboard: "1"
+
+# Create the release namespace with the "restricted" Pod Security Standard
+# enforced. Leave off when the namespace is managed elsewhere (then label it yourself).
+namespace:
+  create: false
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

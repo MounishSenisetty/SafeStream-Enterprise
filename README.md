@@ -114,7 +114,16 @@ evidence without creating a new sensitive artifact. See
 
 ## Deploy in minutes
 
-**Kubernetes (recommended):**
+**Kubernetes (recommended).** With Helm, after creating the namespace and Secret below:
+
+```bash
+helm install safestream deploy/helm/safestream-enterprise --namespace safestream \
+  --set kafka.bootstrapServers=broker-1:9092
+```
+
+Every setting, with its default, is documented in the chart's
+[`values.yaml`](deploy/helm/safestream-enterprise/values.yaml). Without Helm, apply the
+manifest rendered from the same chart with its default values:
 
 ```bash
 kubectl create namespace safestream
@@ -132,13 +141,16 @@ kubectl apply -f deploy/kubernetes/kafka-redactor.yaml
 
 Point your data-lake sinks at `egress-logs-clean`. Producers do not need any changes.
 
-The manifest runs three replicas spread across nodes and zones, with a PodDisruptionBudget so
-node drains take one at a time, in a namespace that enforces the `restricted` Pod Security
-Standard. With the Prometheus Operator, also apply the alert rules:
+The chart runs three replicas spread across nodes and zones, with a PodDisruptionBudget so
+node drains take one at a time, and passes the `restricted` Pod Security Standard. Optional
+parts, each one value to switch on:
 
-```bash
-kubectl apply -f deploy/kubernetes/prometheus-rules.yaml
-```
+| Value | What it adds |
+|---|---|
+| `autoscaling.enabled` | Scales replicas on consumer lag with [KEDA](https://keda.sh), between `minReplicas` and `maxReplicas` (keep that at or below the partition count) |
+| `prometheusRule.enabled` | Alert rules for the Prometheus Operator (also rendered to `deploy/kubernetes/prometheus-rules.yaml`) |
+| `dashboard.enabled` | A Grafana dashboard as a ConfigMap for Grafana's sidecar: throughput, redactions by type, lag, latency percentiles |
+| `audit.topic` | Compliance audit events |
 
 **Docker:**
 
@@ -227,8 +239,8 @@ never appear in logs.
 
 The built-in rules cover common PCI, HIPAA and GDPR field names. To add your own schema's
 fields, such as `loyalty_number` or a vendor signature header, supply a JSON rules file. No
-code change or rebuild is needed. On Kubernetes it's the `safestream-field-rules` ConfigMap in
-the manifest, mounted read-only and named by `SAFESTREAM_FIELD_RULES_FILE`:
+code change or rebuild is needed. On Kubernetes it's the chart's `fieldRules` value, mounted
+read-only from a ConfigMap and named by `SAFESTREAM_FIELD_RULES_FILE`:
 
 ```json
 {
@@ -251,8 +263,8 @@ the manifest, mounted read-only and named by `SAFESTREAM_FIELD_RULES_FILE`:
 - **`mode: "replace"`** uses only your rules.
 - **Validated at startup.** An unknown entity type, a misspelled key, an invalid regex, or a
   `disable` entry that matches no built-in rule stops the pod with a clear error rather than
-  leaving a field unredacted. The file is read once, so after editing the ConfigMap, roll the
-  pods (`kubectl rollout restart`) so every replica uses the same rules.
+  leaving a field unredacted. The file is read once at startup; the chart rolls the pods when
+  `fieldRules` changes, so every replica uses the same rules.
 
 The same rules work from Python:
 
@@ -298,6 +310,30 @@ from the pipeline itself rather than from scraping logs or keeping metrics for y
 - **Setup.** Create the topic with the retention your audit policy needs, and grant the
   connector's account Write on it. Events are keyed by instance, so each pod's events stay in
   order.
+
+### Replaying the dead-letter topic
+
+Dead-lettered records are the original, unredacted records. Once the cause is fixed (a
+producer bug, a topic size limit), `safestream-dlq` sends them back to the **ingress** topic,
+never to the clean one, so they go through redaction like any other record:
+
+```bash
+safestream-dlq summary
+```
+
+```bash
+safestream-dlq replay --error MSG_SIZE_TOO_LARGE --limit 1000
+```
+
+- **`summary`** prints counts by error name (`{"records": 3, "by_error": {...}}`) and changes
+  nothing.
+- **`replay`** reads to the current end of the DLQ, waits for the brokers to acknowledge every
+  replayed record, then commits its position under `--group` (default
+  `<KAFKA_GROUP_ID>-dlq-replay`). A crash before that repeats the run; the next run continues
+  where this one stopped. Records an `--error` filter passes over are not revisited by the
+  same group; use another `--group` to replay them later.
+- It reads the connector's own environment variables, so on Kubernetes run it from the same
+  image and Secret: `python3 -m safestream_enterprise.dlq replay`.
 
 ### Monitoring
 
@@ -372,10 +408,12 @@ SafeStream-Enterprise/
 ├── Dockerfile                          # distroless, non-root connector image
 ├── deploy/
 │   └── kubernetes/
-│       ├── kafka-redactor.yaml         # Namespace, Deployment, PDB, default-deny NetworkPolicy
-│       └── prometheus-rules.yaml       # alerts (Prometheus Operator)
+│   ├── helm/safestream-enterprise/     # the chart: source of truth for everything below
+│   ├── kubernetes/                     # manifests rendered from the chart by render.sh
+│   └── e2e/                            # chart test on a kind cluster (CI)
 ├── src/safestream_enterprise/
 │   ├── batch.py                        # safestream-batch: backfill files / stdin
+│   ├── dlq.py                          # safestream-dlq: summarise and replay the DLQ
 │   ├── logs.py                         # LOG_LEVEL / LOG_FORMAT for both entry points
 │   ├── rules.py                        # custom field rules + the shared redactor factory
 │   ├── parsers/
@@ -433,8 +471,8 @@ uv pip compile pyproject.toml --generate-hashes --python-version 3.13 -o require
 
 ### Releasing
 
-Bump `__version__` in `src/safestream_enterprise/__init__.py` and the image tag in the
-manifest, move the `Unreleased` entries in `CHANGELOG.md` under the new version, merge, then push a tag
+Bump `__version__` in `src/safestream_enterprise/__init__.py` and `version`/`appVersion` in the
+chart's `Chart.yaml`, run `deploy/render.sh`, move the `Unreleased` entries in `CHANGELOG.md` under the new version, merge, then push a tag
 `v<version>`, or create a GitHub Release with that new tag, which pushes it. The release
 workflow:
 
@@ -442,7 +480,9 @@ workflow:
 2. refuses a tag that doesn't match the package version;
 3. smoke-tests the image, then pushes `ghcr.io/mounishsenisetty/safestream-enterprise:<version>`
    (and `:<major>.<minor>`) for linux/amd64 and linux/arm64, with an SBOM and build provenance;
-4. signs the pushed image digest with cosign.
+4. signs the pushed image digest with cosign;
+5. publishes the Helm chart to `oci://ghcr.io/mounishsenisetty/charts/safestream-enterprise`
+   and signs it.
 
 Base images are pinned by digest, and Dependabot proposes digest, dependency and action updates
 weekly.

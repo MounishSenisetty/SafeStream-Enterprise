@@ -11,6 +11,11 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - An unknown `LOG_LEVEL` falls back to `INFO` with a warning instead of a traceback.
 
 ### Added
+- Helm chart (`deploy/helm/safestream-enterprise`), now the source the plain manifests are
+  rendered from. Optional KEDA lag-based autoscaling, alert rules and a Grafana dashboard.
+  Published as a signed OCI chart on release.
+- `safestream-dlq`: summarise the dead-letter topic and replay it through redaction.
+- CI installs the chart on a kind cluster and redacts a record end to end.
 - Metrics: batch and per-record duration histograms, consumer lag and assigned partitions.
 - `bench/run.py` and `docs/benchmarks.md`: measured throughput per core and end to end.
 - Property-based tests for the JSON and XML parsers; an integration test that kills the broker
@@ -25,6 +30,8 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - `LICENSE`, `SECURITY.md`, `CODEOWNERS` and this changelog.
 
 ### Changed
+- The field-rules ConfigMap is named `<release name>-field-rules` (was
+  `safestream-field-rules`), and the pods roll when the rules change.
 - The image moves to Debian 13 and CPython 3.13 (distroless `python3-debian13`). The Debian 12
   runtime image is no longer patched upstream and carried fixable high and critical CVEs.
 - GitHub Actions are pinned to commit SHAs.

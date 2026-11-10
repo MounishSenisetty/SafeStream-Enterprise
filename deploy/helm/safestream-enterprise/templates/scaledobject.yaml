@@ -1,0 +1,50 @@
+{{- if .Values.autoscaling.enabled }}
+# Lag-based autoscaling with KEDA. KEDA's operator queries the brokers for the
+# group's lag; it needs network access to them and the credentials below.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ include "safestream.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "safestream.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "safestream.name" . }}
+  minReplicaCount: {{ .Values.autoscaling.minReplicas }}
+  maxReplicaCount: {{ .Values.autoscaling.maxReplicas }}
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: {{ .Values.kafka.bootstrapServers | quote }}
+        consumerGroup: {{ .Values.kafka.groupId | quote }}
+        topic: {{ .Values.kafka.ingressTopic | quote }}
+        lagThreshold: {{ .Values.autoscaling.lagThreshold | quote }}
+        # A brand-new group has no committed offset: count the whole backlog as lag.
+        offsetResetPolicy: earliest
+        {{- if .Values.kafka.sasl.enabled }}
+        # KEDA's names for the mechanisms: plaintext, scram_sha256, scram_sha512.
+        sasl: {{ .Values.kafka.sasl.mechanism | lower | replace "scram-sha-" "scram_sha" | replace "plain" "plaintext" | quote }}
+        {{- end }}
+        {{- if has .Values.kafka.securityProtocol (list "SSL" "SASL_SSL") }}
+        tls: enable
+        {{- end }}
+      {{- if .Values.kafka.sasl.enabled }}
+      authenticationRef:
+        name: {{ include "safestream.name" . }}
+      {{- end }}
+{{- if .Values.kafka.sasl.enabled }}
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: {{ include "safestream.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "safestream.labels" . | nindent 4 }}
+spec:
+  secretTargetRef:
+    - { parameter: username, name: {{ .Values.existingSecret }}, key: sasl-username }
+    - { parameter: password, name: {{ .Values.existingSecret }}, key: sasl-password }
+{{- end }}
+{{- end }}
