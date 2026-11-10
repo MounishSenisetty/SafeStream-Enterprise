@@ -51,6 +51,7 @@ from typing import BinaryIO
 from safestream_redactor import RedactionMode, RedactionStats
 
 from safestream_enterprise import __version__
+from safestream_enterprise.logs import configure_logging
 from safestream_enterprise.parsers.json_ast import StructuredRedactor
 from safestream_enterprise.rules import make_redactor
 
@@ -235,11 +236,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--report", help="write a content-free JSON report to this path")
     args = parser.parse_args(argv)
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        stream=sys.stderr,  # stdout may be the redacted data stream
-    )
+    configure_logging()  # stderr: stdout may be the redacted data stream
 
     mode = RedactionMode(args.mode)
     hmac_key = os.environ.get("SAFESTREAM_HMAC_KEY")

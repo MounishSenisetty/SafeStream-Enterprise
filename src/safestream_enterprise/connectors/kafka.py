@@ -84,6 +84,7 @@ from safestream_redactor import RedactionMode, RedactionStats
 
 from safestream_enterprise import __version__
 from safestream_enterprise.connectors.health import ConnectorMetrics, HealthServer
+from safestream_enterprise.logs import configure_logging
 from safestream_enterprise.parsers.json_ast import StructuredRedactor
 from safestream_enterprise.rules import make_redactor
 
@@ -112,6 +113,13 @@ PROTECTED_CLIENT_PROPERTIES = frozenset(
         "acks",
         "transactional.id",
     }
+)
+#: Broker verdicts on one record that no retry or restart can change: the
+#: redacted record is too large for the egress topic, or its (preserved) event
+#: time is outside what the topic accepts. Such a record goes to the DLQ;
+#: replaying it would fail the same way forever.
+PERMANENT_RECORD_ERRORS = frozenset(
+    {KafkaError.MSG_SIZE_TOO_LARGE, KafkaError.INVALID_RECORD, KafkaError.INVALID_TIMESTAMP}
 )
 #: Schema identifier carried by every audit event; bump on incompatible change.
 AUDIT_SCHEMA = "safestream.audit/v1"
@@ -304,7 +312,12 @@ class KafkaRedactionConnector:
         self.ready = False
         self.heartbeat = time.monotonic()
         self._running = True
-        self._delivery_errors: list[KafkaError] = []
+        # Failed deliveries with the ingress record they came from (None for a
+        # DLQ record: a failed dead-letter has nowhere further to go).
+        self._delivery_errors: list[tuple[KafkaError, Message | None]] = []
+        # exactly_once: ingress positions whose egress record the broker
+        # rejected for good, with the error name; the retry dead-letters them.
+        self._rejected: dict[tuple[str | None, int | None, int | None], str] = {}
         # Audit window: counters are reported as deltas against the snapshot
         # taken when the previous audit event was *acknowledged*, so a failed
         # send is carried into the next window instead of being lost.
@@ -500,11 +513,6 @@ class KafkaRedactionConnector:
     # batch processing
     # ------------------------------------------------------------------
 
-    def _on_delivery(self, err: KafkaError | None, _msg: Message) -> None:
-        # Runs inside producer.poll()/flush() on this thread: no lock needed.
-        if err is not None:
-            self._delivery_errors.append(err)
-
     def _produce(
         self,
         topic: str,
@@ -512,8 +520,19 @@ class KafkaRedactionConnector:
         key: str | bytes | None,
         headers: list[tuple[str, str | bytes | None]],
         timestamp: int,
+        source: Message | None = None,
     ) -> None:
-        """Produce one record, applying backpressure when the local queue is full."""
+        """Produce one record, applying backpressure when the local queue is full.
+
+        ``source`` is the ingress record an egress record was made from, so a
+        broker rejection can be traced back to it and dead-lettered.
+        """
+
+        def on_delivery(err: KafkaError | None, _msg: Message) -> None:
+            # Runs inside producer.poll()/flush() on this thread: no lock needed.
+            if err is not None:
+                self._delivery_errors.append((err, source))
+
         while True:
             try:
                 self.producer.produce(
@@ -522,7 +541,7 @@ class KafkaRedactionConnector:
                     key=key,
                     headers=headers,
                     timestamp=timestamp,
-                    on_delivery=self._on_delivery,
+                    on_delivery=on_delivery,
                 )
                 return
             except BufferError:
@@ -547,15 +566,12 @@ class KafkaRedactionConnector:
 
     def handle_message(self, msg: Message) -> None:
         """Redact one record and hand it to the producer (not yet acknowledged)."""
-        ts_type, ts = msg.timestamp()
-        # Preserve event time so downstream windowing/retention is unaffected.
-        timestamp = ts if ts_type != TIMESTAMP_NOT_AVAILABLE else 0
-        value: bytes | None = msg.value()
-        key: str | bytes | None = msg.key()
-        headers = msg.headers() or []
-        # Consumed messages carry a list; the stubs also allow a dict.
-        raw_headers = list(headers.items()) if isinstance(headers, dict) else headers
-
+        rejected = self._rejected.get(_position(msg))
+        if rejected:
+            # exactly_once retry: the broker refused this record's redacted form.
+            self._dead_letter(msg, rejected)
+            return
+        value, key, raw_headers, timestamp = _parts(msg)
         try:
             if value is None:
                 # Tombstone: nothing to redact, but compacted topics need it forwarded.
@@ -580,37 +596,45 @@ class KafkaRedactionConnector:
             # Inside the try: a synchronous produce rejection (e.g. the redacted
             # record exceeds message.max.bytes) would otherwise crash-loop on
             # this one record forever.
-            self._produce(self.config.egress_topic, out_value, out_key, out_headers, timestamp)
+            self._produce(
+                self.config.egress_topic, out_value, out_key, out_headers, timestamp, source=msg
+            )
             self.egress_records += 1
         except Exception as exc:  # any per-record failure: DLQ, never egress
-            self._dead_letter(msg, value, key, raw_headers, timestamp, exc)
+            # Class name only: exception messages can quote record content.
+            self._dead_letter(msg, type(exc).__name__)
 
-    def _dead_letter(
-        self,
-        msg: Message,
-        value: bytes | None,
-        key: str | bytes | None,
-        headers: list[tuple[str, str | bytes | None]],
-        timestamp: int,
-        exc: Exception,
-    ) -> None:
-        """Route the *original* record to the DLQ, tagged with the exception class."""
-        # Class name only: exception messages can quote record content.
+    def _dead_letter(self, msg: Message, reason: str) -> None:
+        """Route the *original* record to the DLQ, tagged with ``reason``.
+
+        ``reason`` is an exception class or Kafka error name, never free text
+        that could quote record content.
+        """
         logger.error(
-            "dead-lettering %s[%s]@%s (%s)",
-            msg.topic(),
-            msg.partition(),
-            msg.offset(),
-            type(exc).__name__,
+            "dead-lettering %s[%s]@%s (%s)", msg.topic(), msg.partition(), msg.offset(), reason
         )
+        value, key, headers, timestamp = _parts(msg)
         self.dead_lettered += 1
         self._produce(
             self.config.dlq_topic,
             value,
             key,
-            [*headers, (ERROR_HEADER, type(exc).__name__.encode())],
+            [*headers, (ERROR_HEADER, reason.encode())],
             timestamp,
         )
+
+    def _take_rejected(self) -> tuple[list[tuple[KafkaError, Message]], list[KafkaError]]:
+        """Drain delivery errors into (records the broker rejected for good, the rest)."""
+        failures, self._delivery_errors = self._delivery_errors, []
+        rejected = [
+            (err, src)
+            for err, src in failures
+            if src is not None and err.code() in PERMANENT_RECORD_ERRORS
+        ]
+        other = [
+            err for err, src in failures if src is None or err.code() not in PERMANENT_RECORD_ERRORS
+        ]
+        return rejected, other
 
     def process_batch(self, batch: list[Message]) -> None:
         """Redact and publish a batch, then commit its offsets (all or nothing)."""
@@ -642,9 +666,18 @@ class KafkaRedactionConnector:
     def _process_at_least_once(self, messages: list[Message]) -> None:
         self._publish(messages)
         remaining = self.producer.flush(self.config.flush_timeout_s)
-        if remaining or self._delivery_errors:
-            errors = [str(e) for e in self._delivery_errors[:5]]
-            self._delivery_errors.clear()
+        rejected, other = self._take_rejected()
+        if rejected and not remaining and not other:
+            # The broker refused these records and will refuse them again after
+            # a restart, so a replay would loop forever. Everything else in the
+            # batch was acknowledged: dead-letter the originals and carry on.
+            for err, src in rejected:
+                self.egress_records -= 1
+                self._dead_letter(src, err.name())
+            remaining = self.producer.flush(self.config.flush_timeout_s)
+            rejected, other = self._take_rejected()
+        if remaining or rejected or other:
+            errors = [str(e) for e in [*other, *(e for e, _ in rejected)][:5]]
             raise DeliveryError(
                 f"{remaining} record(s) unflushed, delivery errors: {errors}; "
                 "offsets NOT committed, batch will be replayed after restart"
@@ -683,11 +716,16 @@ class KafkaRedactionConnector:
                     error.name(),
                 )
                 self.producer.abort_transaction(self.config.flush_timeout_s)
-                self._delivery_errors.clear()
+                # A record the broker rejected for good would abort every retry
+                # too: remember it, and the next attempt dead-letters it instead.
+                self.producer.poll(0)  # serve any delivery reports still queued
+                rejected, _ = self._take_rejected()
+                self._rejected.update({_position(src): err.name() for err, src in rejected})
                 self.stats, self.dead_lettered, self.egress_records = saved
                 self.transaction_aborts += 1
                 continue
             self._delivery_errors.clear()
+            self._rejected.clear()
             self.batches += 1
             self._committed = self.snapshot()
             return
@@ -708,6 +746,23 @@ class KafkaRedactionConnector:
             except KafkaException as exc:
                 if not exc.args[0].retriable() or attempt == MAX_TRANSACTION_ATTEMPTS:
                     raise
+
+
+def _position(msg: Message) -> tuple[str | None, int | None, int | None]:
+    return msg.topic(), msg.partition(), msg.offset()
+
+
+def _parts(
+    msg: Message,
+) -> tuple[bytes | None, str | bytes | None, list[tuple[str, str | bytes | None]], int]:
+    """``(value, key, headers, timestamp)`` of a consumed record."""
+    ts_type, ts = msg.timestamp()
+    # Preserve event time so downstream windowing/retention is unaffected.
+    timestamp = ts if ts_type != TIMESTAMP_NOT_AVAILABLE else 0
+    headers = msg.headers() or []
+    # Consumed messages carry a list; the stubs also allow a dict.
+    raw_headers = list(headers.items()) if isinstance(headers, dict) else headers
+    return msg.value(), msg.key(), raw_headers, timestamp
 
 
 def _next_offsets(messages: list[Message]) -> list[TopicPartition]:
@@ -745,10 +800,7 @@ def build_redactor(config: ConnectorConfig) -> StructuredRedactor:
 
 def main() -> int:
     """Console entry point (``safestream-kafka``). Exit code 0 on clean stop."""
-    logging.basicConfig(
-        level=os.environ.get("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
-    )
+    configure_logging()
     try:
         config = ConnectorConfig.from_env()
         redactor = build_redactor(config)

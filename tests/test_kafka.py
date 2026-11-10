@@ -456,3 +456,35 @@ def test_audit_never_reports_an_uncommitted_batch() -> None:
     # the batch will be replayed after restart and counted then, exactly once
     assert audit["records"] == {"egress": 0, "dlq": 0} and audit["redactions"] == {}
     assert conn.snapshot().egress_records == 1  # live metrics still show the attempt
+
+
+class RejectingProducer(FakeProducer):
+    """A broker that refuses every egress record with ``code``; the DLQ accepts."""
+
+    def __init__(self, code: int) -> None:
+        super().__init__()
+        self.code = code
+
+    def produce(self, topic: str, **kw: Any) -> None:
+        self.sent.append({"topic": topic, **kw})
+        err = KafkaError(self.code) if topic == "egress-logs-clean" else None
+        self._pending.append(lambda _e, m, cb=kw["on_delivery"]: cb(err, m))
+
+
+def test_record_rejected_for_good_by_the_broker_is_dead_lettered() -> None:
+    p = RejectingProducer(KafkaError.MSG_SIZE_TOO_LARGE)
+    conn, c = make(p)
+    conn.process_batch([FakeMsg(b'{"email": "a@b.example"}', key=b"k")])  # type: ignore[list-item]
+    dlq = [m for m in p.sent if m["topic"] == "ingress-logs-dlq"]
+    # The original record, tagged with the broker's verdict; offsets move on.
+    assert [m["value"] for m in dlq] == [b'{"email": "a@b.example"}']
+    assert ("x-safestream-error", b"MSG_SIZE_TOO_LARGE") in dlq[0]["headers"]
+    assert (c.commits, conn.egress_records, conn.dead_lettered) == (1, 0, 1)
+
+
+def test_transient_broker_failure_is_never_dead_lettered() -> None:
+    p = RejectingProducer(KafkaError.NOT_ENOUGH_REPLICAS)
+    conn, c = make(p)
+    with pytest.raises(DeliveryError):
+        conn.process_batch([FakeMsg(b'{"a": 1}')])  # type: ignore[list-item]
+    assert c.commits == 0 and all(m["topic"] == "egress-logs-clean" for m in p.sent)

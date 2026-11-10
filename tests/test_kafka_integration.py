@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import socket
 import subprocess
 import threading
@@ -21,7 +22,13 @@ from pathlib import Path
 
 import pytest
 from confluent_kafka import Consumer, Message, Producer, TopicPartition
-from confluent_kafka.admin import AdminClient, NewTopic
+from confluent_kafka.admin import (
+    AdminClient,
+    AlterConfigOpType,
+    ConfigEntry,
+    ConfigResource,
+    NewTopic,
+)
 
 from safestream_enterprise import DEFAULT_FIELD_RULES
 from safestream_enterprise.connectors.kafka import (
@@ -217,6 +224,49 @@ def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str], deli
     assert sum(e["records"]["egress"] for e in events) == 4
     assert sum(e["records"]["dlq"] for e in events) == 1
     assert sum(e["redactions"].get("email", 0) for e in events) >= 1
+
+
+@pytest.mark.parametrize("delivery", ["at_least_once", "exactly_once"])
+def test_record_the_egress_topic_rejects_is_dead_lettered(
+    topics: dict[str, str], delivery: str
+) -> None:
+    """A record too large for the clean topic must not crash-loop the connector."""
+    admin = AdminClient({"bootstrap.servers": BOOTSTRAP})
+    limit = ConfigEntry("max.message.bytes", "20000", incremental_operation=AlterConfigOpType.SET)
+    resource = ConfigResource(
+        ConfigResource.Type.TOPIC, topics["egress"], incremental_configs=[limit]
+    )
+    for future in admin.incremental_alter_configs([resource]).values():
+        future.result(30)
+    # Random short words: nothing to redact, and too little repetition for zstd
+    # to shrink the record under the topic limit.
+    rng = random.Random(7)
+    words = ["".join(rng.choices("abcdefghijklmnopqrstuvwxyz", k=4)) for _ in range(40_000)]
+    big = json.dumps({"id": "big", "note": " ".join(words)}).encode()
+    group = f"it-connector-{uuid.uuid4().hex[:8]}"
+    config = ConnectorConfig(
+        bootstrap_servers=BOOTSTRAP,
+        group_id=group,
+        ingress_topic=topics["ingress"],
+        egress_topic=topics["egress"],
+        dlq_topic=topics["dlq"],
+        delivery=delivery,  # type: ignore[arg-type]
+        metrics_port=0,
+    )
+    with Running(config):
+        # Separate batches: the broker's limit applies to a whole produce batch,
+        # so a record sent together with the big one would be rejected with it.
+        produce(topics["ingress"], [(b"k1", json.dumps(PII_RECORD).encode())])
+        clean = drain(topics["egress"], expected=1)
+        produce(topics["ingress"], [(b"k2", big)])
+        dead = drain(topics["dlq"], expected=1)
+        produce(topics["ingress"], [(b"k3", json.dumps(PII_RECORD).encode())])
+        clean = drain(topics["egress"], expected=2)
+
+    assert [m.key() for m in clean] == [b"k1", b"k3"]
+    assert [m.value() for m in dead] == [big]  # the original, for replay after a fix
+    assert dict(dead[0].headers() or [])["x-safestream-error"] == b"MSG_SIZE_TOO_LARGE"
+    assert committed_lag(group, topics["ingress"]) == 0
 
 
 @pytest.mark.skipif(not IMAGE, reason="SAFESTREAM_IT_IMAGE not set")
