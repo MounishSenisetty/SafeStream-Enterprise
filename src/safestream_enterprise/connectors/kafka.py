@@ -64,7 +64,9 @@ import socket
 import sys
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
@@ -83,7 +85,7 @@ from confluent_kafka import (
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from safestream_redactor import RedactionMode, RedactionStats
 
-from safestream_enterprise import __version__
+from safestream_enterprise import __version__, audit, policy
 from safestream_enterprise.connectors.health import (
     BATCH_BUCKETS,
     RECORD_BUCKETS,
@@ -130,7 +132,7 @@ PERMANENT_RECORD_ERRORS = frozenset(
     {KafkaError.MSG_SIZE_TOO_LARGE, KafkaError.INVALID_RECORD, KafkaError.INVALID_TIMESTAMP}
 )
 #: Schema identifier carried by every audit event; bump on incompatible change.
-AUDIT_SCHEMA = "safestream.audit/v1"
+AUDIT_SCHEMA = audit.SCHEMA
 
 
 class DeliveryError(RuntimeError):
@@ -188,6 +190,13 @@ class ConnectorConfig(BaseModel):
     policy_min_version: int = Field(default=1, ge=1)
     #: How often the bundle file is checked for a new version.
     policy_reload_s: float = Field(default=30.0, gt=0)
+    #: Candidate bundle evaluated in shadow beside the policy in force: its
+    #: output is never published, only compared (see ``Shadow``). The file may
+    #: be absent, which means there is no candidate.
+    shadow_policy_file: Path | None = None
+    #: Evaluate the candidate on every Nth record (1 = all). Shadowing a record
+    #: costs a second redaction.
+    shadow_sample_every: int = Field(default=1, ge=1)
     #: Topic for compliance audit events (see :meth:`KafkaRedactionConnector.audit_event`);
     #: ``None`` disables auditing.
     audit_topic: str | None = Field(default=None, min_length=1)
@@ -224,6 +233,8 @@ class ConnectorConfig(BaseModel):
             raise ValueError(
                 "SAFESTREAM_POLICY_FILE and SAFESTREAM_POLICY_PUBLIC_KEYS must be set together"
             )
+        if self.shadow_policy_file and not self.policy_file:
+            raise ValueError("SAFESTREAM_SHADOW_POLICY_FILE requires SAFESTREAM_POLICY_FILE")
         if self.transactional_id and self.delivery != "exactly_once":
             raise ValueError(
                 "SAFESTREAM_TRANSACTIONAL_ID requires SAFESTREAM_DELIVERY=exactly_once"
@@ -269,6 +280,8 @@ class ConnectorConfig(BaseModel):
             "SAFESTREAM_POLICY_TENANT": "policy_tenant",
             "SAFESTREAM_POLICY_MIN_VERSION": "policy_min_version",
             "SAFESTREAM_POLICY_RELOAD_S": "policy_reload_s",
+            "SAFESTREAM_SHADOW_POLICY_FILE": "shadow_policy_file",
+            "SAFESTREAM_SHADOW_SAMPLE_EVERY": "shadow_sample_every",
             "SAFESTREAM_AUDIT_TOPIC": "audit_topic",
             "SAFESTREAM_AUDIT_INTERVAL_S": "audit_interval_s",
         }
@@ -315,6 +328,45 @@ class ConnectorConfig(BaseModel):
         return {**config, **self._overrides()}
 
 
+@dataclass
+class Shadow:
+    """A candidate policy being evaluated beside the one in force.
+
+    Each sampled record is redacted a second time under the candidate. That
+    output is discarded; what is kept is how the two policies differ, as
+    counts: enough to see what promoting the candidate would change, with no
+    record content.
+    """
+
+    policy: Policy
+    redactor: StructuredRedactor
+    since: str
+    records: int = 0
+    #: Records whose redacted output would differ under the candidate.
+    changed: int = 0
+    errors: int = 0
+    #: Redactions on the sampled records, by entity type, under each policy.
+    active: Counter[str] = field(default_factory=Counter)
+    candidate: Counter[str] = field(default_factory=Counter)
+
+    def report(self) -> dict[str, object]:
+        return {
+            "candidate": {
+                "tenant": self.policy.tenant,
+                "version": self.policy.version,
+                "key_id": self.policy.key_id,
+            },
+            "since": self.since,
+            "records": self.records,
+            "changed_records": self.changed,
+            "errors": self.errors,
+            "redactions": {
+                "active": dict(sorted(self.active.items())),
+                "candidate": dict(sorted(self.candidate.items())),
+            },
+        }
+
+
 class KafkaRedactionConnector:
     """Consume ingress, redact each record, publish to egress, commit offsets.
 
@@ -336,8 +388,23 @@ class KafkaRedactionConnector:
         #: Signed policy in force, and where newer ones come from (both or neither).
         self.policy = policy
         self._policy_source = policy_source
-        self._policy_due = time.monotonic() + config.policy_reload_s
+        self._policy_due = 0.0  # look for a candidate on the first loop iteration
         self.policy_rejections = 0
+        self.shadow: Shadow | None = None
+        self._shadow_source = (
+            PolicySource(
+                config.shadow_policy_file,
+                policy_source.trusted,
+                policy_source.tenant,
+                policy_source.min_version,
+            )
+            if policy_source and config.shadow_policy_file
+            else None
+        )
+        self._shadow_tick = 0
+        # Audit hash chain: one per run of this process (see safestream_enterprise.audit).
+        self._chain_seq = 0
+        self._chain_prev: str | None = None
         self.consumer = consumer
         self.producer = producer
         self.stats = RedactionStats()
@@ -366,6 +433,7 @@ class KafkaRedactionConnector:
         # taken when the previous audit event was *acknowledged*, so a failed
         # send is carried into the next window instead of being lost.
         self.instance = socket.gethostname()  # the pod name on Kubernetes
+        self._chain_id = f"{self.instance}-{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}"
         # Counters as of the last *committed* batch. Audits report from this, so
         # records of a batch that failed (and will be replayed after a restart)
         # are never reported, and replays are never counted twice.
@@ -389,6 +457,7 @@ class KafkaRedactionConnector:
             lag=self.lag,
             policy_version=self.policy.version if self.policy else None,
             policy_rejections=self.policy_rejections,
+            shadow=self.shadow.report() if self.shadow else None,
             assigned_partitions=self.assigned_partitions,
             batch_seconds=self.batch_seconds.copy(),
             record_seconds=self.record_seconds.copy(),
@@ -476,6 +545,16 @@ class KafkaRedactionConnector:
         if self._policy_source is None or time.monotonic() < self._policy_due:
             return
         self._policy_due = time.monotonic() + self.config.policy_reload_s
+        self._reload_active_policy()
+        self._reload_shadow()
+
+    def _close_audit_window(self) -> None:
+        """Publish the current window now, so the next one starts under new settings."""
+        self._audit_due = 0.0
+        self._maybe_audit()
+
+    def _reload_active_policy(self) -> None:
+        assert self._policy_source is not None
         try:
             new = self._policy_source.load(self.policy)
             if new is None:
@@ -487,8 +566,7 @@ class KafkaRedactionConnector:
             return
         # Close the audit window first, so every audit event describes records
         # redacted under one policy.
-        self._audit_due = 0.0
-        self._maybe_audit()
+        self._close_audit_window()
         self.redactor, self.policy = redactor, new
         logger.info(
             "policy version %d now in force (tenant=%s, key=%s, %d rules)",
@@ -497,6 +575,70 @@ class KafkaRedactionConnector:
             new.key_id,
             redactor.rule_count,
         )
+
+    def _reload_shadow(self) -> None:
+        """Start, replace or stop shadow evaluation to match the candidate file.
+
+        A candidate is advisory: one that is refused is logged and counted, and
+        never stops or changes redaction.
+        """
+        source = self._shadow_source
+        if source is None or self.policy is None:
+            return
+        candidate: Policy | None = None
+        redactor: StructuredRedactor | None = None
+        if source.path.exists():
+            try:
+                # No "must be newer than the last candidate": candidates are
+                # replaced freely. Signature, tenant and floor still apply.
+                candidate = policy.verify(
+                    source.path.read_bytes(), source.trusted, source.tenant, source.min_version
+                )
+                if candidate.version <= self.policy.version:
+                    candidate = None  # promoted (or stale): nothing left to compare
+                elif self.shadow and candidate.digest == self.shadow.policy.digest:
+                    return  # already evaluating this one
+                else:
+                    redactor = build_redactor(self.config, candidate)
+            except OSError:
+                candidate = None  # removed between the check and the read
+            except ValueError as exc:
+                self.policy_rejections += 1
+                logger.error("candidate policy bundle refused, not evaluating it: %s", exc)
+                return
+        if candidate is None and self.shadow is None:
+            return
+        self._close_audit_window()  # one candidate per audit window
+        if candidate is None:
+            logger.info("shadow evaluation ended (candidate promoted or withdrawn)")
+            self.shadow = None
+            return
+        assert redactor is not None
+        self.shadow = Shadow(
+            candidate, redactor, datetime.now(timezone.utc).isoformat(timespec="seconds")
+        )
+        logger.info(
+            "evaluating candidate policy version %d in shadow (every %s record)",
+            candidate.version,
+            self.config.shadow_sample_every,
+        )
+
+    def _shadow_evaluate(self, value: bytes, published: bytes, found: RedactionStats) -> None:
+        """Redact ``value`` under the candidate and record how it differs. Never raises."""
+        shadow = self.shadow
+        assert shadow is not None
+        try:
+            theirs = RedactionStats()
+            would_publish = shadow.redactor.redact_line(
+                value, theirs, strict=self.config.unparseable == "dlq"
+            ).data
+        except Exception:
+            shadow.errors += 1  # the candidate must never affect the real record
+            return
+        shadow.records += 1
+        shadow.changed += would_publish != published
+        shadow.active.update(found.counts)
+        shadow.candidate.update(theirs.counts)
 
     # ------------------------------------------------------------------
     # compliance audit events
@@ -546,6 +688,8 @@ class KafkaRedactionConnector:
                 if self.policy
                 else None
             ),
+            "shadow": current.shadow,
+            "chain": {"id": self._chain_id, "seq": self._chain_seq, "prev": self._chain_prev},
             "window": {
                 "start": start.isoformat(timespec="milliseconds"),
                 "end": end.isoformat(timespec="milliseconds"),
@@ -576,9 +720,14 @@ class KafkaRedactionConnector:
         current = self._committed
         end = datetime.now(timezone.utc)
         event = self.audit_event(self._audit_base, current, self._audit_window_start, end, final)
-        if self._publish_audit(orjson.dumps(event)):
+        data = orjson.dumps(event)
+        if self._publish_audit(data):
             self._audit_base, self._audit_window_start = current, end
             self.audit_events += 1
+            # The chain advances only on an acknowledged event: a failed one is
+            # rebuilt next time with the same place in the chain.
+            self._chain_seq += 1
+            self._chain_prev = audit.event_hash(data)
         else:
             self.audit_failures += 1
 
@@ -697,11 +846,17 @@ class KafkaRedactionConnector:
             else:
                 # JSON and XML are both handled structurally. strict: anything
                 # else raises StructuredParseError -> DLQ.
+                found = RedactionStats()
                 record = self.redactor.redact_line(
-                    value, self.stats, strict=self.config.unparseable == "dlq"
+                    value, found, strict=self.config.unparseable == "dlq"
                 )
+                self.stats.merge(found)
                 out_value = record.data
                 mode = b"structural" if record.structured else b"text"
+                if self.shadow is not None:
+                    self._shadow_tick += 1
+                    if self._shadow_tick % self.config.shadow_sample_every == 0:
+                        self._shadow_evaluate(value, record.data, found)
             # Keys and header values can carry PII too (user-id partition keys,
             # forwarded auth headers). Values without findings come back unchanged,
             # so ordinary keys still hash to the same partition.
@@ -819,6 +974,10 @@ class KafkaRedactionConnector:
         for attempt in range(1, MAX_TRANSACTION_ATTEMPTS + 1):
             # Counters are restored on abort so a retried batch isn't counted twice.
             saved = (copy.deepcopy(self.stats), self.dead_lettered, self.egress_records)
+            saved_shadow = copy.copy(self.shadow)
+            if saved_shadow is not None:
+                saved_shadow.active = Counter(saved_shadow.active)
+                saved_shadow.candidate = Counter(saved_shadow.candidate)
             self.producer.begin_transaction()
             try:
                 self._publish(messages)
@@ -843,6 +1002,7 @@ class KafkaRedactionConnector:
                 rejected, _ = self._take_rejected()
                 self._rejected.update({_position(src): err.name() for err, src in rejected})
                 self.stats, self.dead_lettered, self.egress_records = saved
+                self.shadow = saved_shadow
                 self.transaction_aborts += 1
                 continue
             self._delivery_errors.clear()

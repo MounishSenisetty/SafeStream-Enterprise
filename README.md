@@ -225,6 +225,8 @@ with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
 | `SAFESTREAM_POLICY_TENANT` | none | Refuse bundles for any other tenant |
 | `SAFESTREAM_POLICY_MIN_VERSION` | `1` | Refuse bundles below this version |
 | `SAFESTREAM_POLICY_RELOAD_S` | `30` | How often the bundle file is checked for a newer version |
+| `SAFESTREAM_SHADOW_POLICY_FILE` | none | Candidate bundle to evaluate in shadow; the file may be absent. See [Shadow mode](#shadow-mode-try-a-policy-before-it-applies) |
+| `SAFESTREAM_SHADOW_SAMPLE_EVERY` | `1` | Shadow every Nth record. Each shadowed record is redacted a second time |
 | `SAFESTREAM_AUDIT_TOPIC` | none | Topic for compliance audit events; unset turns auditing off. See [Compliance audit events](#compliance-audit-events) |
 | `SAFESTREAM_AUDIT_INTERVAL_S` | `60` | Seconds per audit window (minimum 1) |
 | `SAFESTREAM_METRICS_PORT` | `9400` | Port for `/healthz`, `/readyz` and `/metrics`; `0` turns the endpoint off. See [Monitoring](#monitoring) |
@@ -325,6 +327,48 @@ The signature moves trust from "who can edit the ConfigMap" to "who holds the si
 who can change the connector's trusted keys". Keep the trusted keys in configuration that is
 reviewed (the chart values in Git), not next to the bundle.
 
+### Shadow mode: try a policy before it applies
+
+A rule change is a guess until it meets real traffic: it may miss the field it was written
+for, or redact one your analysts need. Shadow mode answers that before anything changes, and
+without anyone looking at the data. Put the signed candidate next to the policy as
+`candidate.json` (the same ConfigMap on Kubernetes):
+
+```bash
+safestream-policy sign new-rules.json --key policy-signing.key --tenant acme --version 8 -o candidate.json
+```
+
+Each connector then redacts every sampled record twice: once under the policy in force, which
+is what gets published, and once under the candidate, which is discarded. It reports the
+difference as counts, in `/metrics` and in every audit event:
+
+```json
+"shadow": {
+  "candidate": {"tenant": "acme", "version": 8, "key_id": "9a41c0de52b7f310"},
+  "since": "2026-11-11T09:00:00+00:00",
+  "records": 48210,
+  "changed_records": 4100,
+  "errors": 0,
+  "redactions": {
+    "active": {"email": 9120, "person": 4471},
+    "candidate": {"email": 9120, "id_number": 4100, "person": 4471}
+  }
+}
+```
+
+Read it as: of 48,210 records, 4,100 would come out differently; the candidate adds 4,100
+`id_number` redactions and loses none of what is caught today. A type whose count *drops*
+under the candidate is the thing to look for before promoting.
+
+- **Promote** by publishing the same signed file as `policy.json`. Connectors adopt it and
+  the comparison ends by itself. **Withdraw** by removing `candidate.json`.
+- **A candidate never touches output.** It needs a trusted signature like any bundle; one
+  that is refused, or that fails on a record, is counted and changes nothing.
+- **Cost.** A shadowed record is redacted twice. `SAFESTREAM_SHADOW_SAMPLE_EVERY=10` shadows
+  one record in ten.
+- **Scope.** Record values are compared. Keys and headers are not, since field rules do not
+  apply to them.
+
 ### Compliance audit events
 
 With `SAFESTREAM_AUDIT_TOPIC` set, every connector instance publishes one event per window
@@ -333,7 +377,7 @@ from the pipeline itself rather than from scraping logs or keeping metrics for y
 
 ```json
 {
-  "schema": "safestream.audit/v1",
+  "schema": "safestream.audit/v2",
   "connector_version": "0.3.0",
   "instance": "safestream-kafka-redactor-7d9f8-x2k4q",
   "group_id": "safestream-redactor",
@@ -342,6 +386,8 @@ from the pipeline itself rather than from scraping logs or keeping metrics for y
   "redaction_mode": "pseudonymize",
   "field_rules": {"count": 68, "fingerprint": "sha256:3f1c…"},
   "policy": {"tenant": "acme", "version": 7, "key_id": "9a41c0de52b7f310"},
+  "shadow": null,
+  "chain": {"id": "safestream-kafka-redactor-7d9f8-x2k4q-20261105T115900000000Z", "seq": 1, "prev": "sha256:8c2e…"},
   "window": {"start": "2026-11-05T12:00:00.000+00:00", "end": "2026-11-05T12:01:00.000+00:00", "final": false},
   "records": {"egress": 48210, "dlq": 3},
   "redactions": {"email": 9120, "person": 4471, "secret": 37},
@@ -357,6 +403,20 @@ from the pipeline itself rather than from scraping logs or keeping metrics for y
   failure is logged and counted in `safestream_audit_failures_total`, and the next event covers
   the whole period. A final event closes the window on shutdown. Empty windows are reported
   too, since "nothing processed" is evidence as well.
+- **Tamper-evident.** Each event names its place in a hash chain: `chain.prev` is the SHA-256
+  of the previous event exactly as published. One chain covers one run of one connector; a
+  restart starts a new one. Export the topic and check it:
+
+  ```bash
+  safestream-audit verify audit.ndjson --require-closed
+  ```
+
+  It reports any event that was altered, removed, reordered or replayed, and prints each
+  chain's `head`. A chain alone cannot show that its last events, or the whole chain, were
+  deleted, or that someone able to rewrite every copy rebuilt it. Record the heads somewhere
+  the audit store's administrators cannot write, and check later with
+  `--head <chain id>=<hash>`. `--require-closed` also fails a chain that does not end with a
+  clean shutdown, which is either a crash or missing final events.
 - **Never blocks redaction.** An audit failure doesn't stop the pipeline. In exactly-once mode
   each event is its own small transaction.
 - **Setup.** Create the topic with the retention your audit policy needs, and grant the
@@ -412,6 +472,10 @@ Kubernetes manifest wires them up as probes and for Prometheus scraping.
 | `safestream_assigned_partitions` | gauge | Ingress partitions assigned to this instance |
 | `safestream_policy_version` | gauge | Version of the signed policy in force (only with a policy bundle) |
 | `safestream_policy_rejections_total` | counter | Policy bundles refused: bad signature, rollback, wrong tenant or invalid rules |
+| `safestream_shadow_policy_version` | gauge | Candidate policy being evaluated in shadow (only while one is) |
+| `safestream_shadow_records_total` | counter | Records also redacted under the candidate |
+| `safestream_shadow_changed_records_total` | counter | Records whose output would differ under the candidate |
+| `safestream_shadow_redactions_total{policy="active"\|"candidate",entity_type="..."}` | counter | Redactions on shadowed records under each policy |
 | `safestream_heartbeat_age_seconds` | gauge | Seconds since the main loop last advanced |
 | `safestream_ready` | gauge | 1 while consuming |
 
@@ -476,6 +540,7 @@ SafeStream-Enterprise/
 │   ├── batch.py                        # safestream-batch: backfill files / stdin
 │   ├── dlq.py                          # safestream-dlq: summarise and replay the DLQ
 │   ├── policy.py                       # safestream-policy: signed policy bundles
+│   ├── audit.py                        # safestream-audit: verify the audit hash chain
 │   ├── logs.py                         # LOG_LEVEL / LOG_FORMAT for both entry points
 │   ├── rules.py                        # custom field rules + the shared redactor factory
 │   ├── parsers/

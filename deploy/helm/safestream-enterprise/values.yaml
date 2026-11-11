@@ -79,6 +79,12 @@ policy:
   publicKeys: []
   # Refuse bundles for any other tenant.
   tenant: ""
+  # A second key in the same ConfigMap, candidate.json, is evaluated in shadow:
+  # redaction under it is compared with the policy in force and reported as
+  # counts (metrics and audit events), and never published. Promote it by
+  # making it policy.json. Shadowing costs a second redaction per sampled
+  # record: 10 here means every tenth record.
+  shadowSampleEvery: 1
   # Refuse bundles below this version. Raise it when you retire a policy, so
   # an old signed bundle cannot be put back after a restart.
   minVersion: 1

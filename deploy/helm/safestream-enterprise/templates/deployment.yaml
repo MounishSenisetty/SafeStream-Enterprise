@@ -95,6 +95,10 @@ spec:
             - name: SAFESTREAM_POLICY_TENANT
               value: {{ . | quote }}
             {{- end }}
+            - name: SAFESTREAM_SHADOW_POLICY_FILE
+              value: /etc/safestream/candidate.json
+            - name: SAFESTREAM_SHADOW_SAMPLE_EVERY
+              value: {{ .Values.policy.shadowSampleEvery | quote }}
             - name: SAFESTREAM_POLICY_MIN_VERSION
               value: {{ .Values.policy.minVersion | quote }}
             {{- else }}

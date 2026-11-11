@@ -32,7 +32,7 @@ from confluent_kafka.admin import (
 )
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from safestream_enterprise import DEFAULT_FIELD_RULES, dlq, policy
+from safestream_enterprise import DEFAULT_FIELD_RULES, audit, dlq, policy
 from safestream_enterprise.connectors.kafka import (
     ConnectorConfig,
     KafkaRedactionConnector,
@@ -225,7 +225,7 @@ def test_end_to_end_redaction_dlq_commit_and_resume(topics: dict[str, str], deli
     # account for exactly what was processed (3 + 1 egress, 1 DLQ), no more.
     events = [json.loads(m.value()) for m in drain(topics["audit"], 2)]
     assert len(events) == 2 and all(e["window"]["final"] for e in events)
-    assert all(e["schema"] == "safestream.audit/v1" and e["delivery"] == delivery for e in events)
+    assert all(e["schema"] == "safestream.audit/v2" and e["delivery"] == delivery for e in events)
     assert sum(e["records"]["egress"] for e in events) == 4
     assert sum(e["records"]["dlq"] for e in events) == 1
     assert sum(e["redactions"].get("email", 0) for e in events) >= 1
@@ -332,11 +332,16 @@ def test_policy_is_swapped_under_load_without_a_restart(
     key, intruder = Ed25519PrivateKey.generate(), Ed25519PrivateKey.generate()
     path = tmp_path / "policy.json"
 
-    def publish(version: int, rules: dict[str, str], signer: Ed25519PrivateKey = key) -> None:
+    def publish(
+        version: int,
+        rules: dict[str, str],
+        signer: Ed25519PrivateKey = key,
+        to: str = "policy.json",
+    ) -> None:
         # Write-then-rename, as a ConfigMap volume update does: never a half-written file.
         staged = tmp_path / "policy.next"
         staged.write_bytes(policy.sign({"rules": rules}, signer, "acme", version))
-        staged.replace(path)
+        staged.replace(tmp_path / to)
 
     publish(1, {})
     config = ConnectorConfig(
@@ -350,6 +355,7 @@ def test_policy_is_swapped_under_load_without_a_restart(
         policy_file=path,
         policy_public_keys=policy.encode_public_key(key.public_key()),
         policy_tenant="acme",
+        shadow_policy_file=tmp_path / "candidate.json",
         policy_reload_s=0.2,
         poll_timeout_s=0.2,
         metrics_port=0,
@@ -384,6 +390,18 @@ def test_policy_is_swapped_under_load_without_a_restart(
     feeder.start()
     try:
         wait_for(lambda: connector.egress_records > 50, "records under version 1")
+        # First as a candidate: evaluated on live traffic, published nowhere.
+        publish(2, {"*loyalty_number*": "id_number"}, to="candidate.json")
+        wait_for(
+            lambda: connector.shadow is not None and connector.shadow.records > 50,
+            "the candidate to be evaluated in shadow",
+        )
+        shadowed = connector.shadow.report() if connector.shadow else {}
+        assert shadowed["changed_records"] == shadowed["records"]  # every record would change
+        assert shadowed["redactions"]["active"] == {}
+        assert shadowed["redactions"]["candidate"] == {"id_number": shadowed["records"]}
+        assert connector.snapshot().policy_version == 1  # and nothing has changed yet
+        # Then promoted: the same signed bundle becomes the policy.
         publish(2, {"*loyalty_number*": "id_number"})
         wait_for(lambda: connector.snapshot().policy_version == 2, "version 2 to take effect")
         mark = connector.egress_records
@@ -409,10 +427,25 @@ def test_policy_is_swapped_under_load_without_a_restart(
     switch = values.index(clean)
     assert set(values[:switch]) == {raw} and set(values[switch:]) == {clean}
     assert connector.policy is not None and connector.policy.version == 2
-    # Each audit event covers one policy; the swap closed the version-1 window.
-    audits = [json.loads(m.value() or b"{}") for m in drain(topics["audit"], 2, timeout_s=10)]
-    assert [a["policy"]["version"] for a in audits][:2] == [1, 2]
-    assert "id_number" not in audits[0]["redactions"] and audits[1]["redactions"]["id_number"] > 0
+    assert connector.shadow is None  # promotion ended the comparison
+    # Each audit event covers one policy and one candidate: starting the shadow
+    # and promoting it both closed a window.
+    raw_audits = [m.value() or b"" for m in drain(topics["audit"], 3, timeout_s=10)]
+    audits = [json.loads(a) for a in raw_audits]
+    versions = [a["policy"]["version"] for a in audits]
+    assert versions == sorted(versions) and set(versions) == {1, 2}
+    for event in audits:
+        redacted = event["redactions"].get("id_number", 0)
+        assert (redacted > 0) == (event["policy"]["version"] == 2) or event["records"][
+            "egress"
+        ] == 0
+    in_shadow = [a["shadow"] for a in audits if a["shadow"]]
+    assert in_shadow and in_shadow[-1]["candidate"]["version"] == 2
+    assert in_shadow[-1]["changed_records"] > 0 and "L-4242-77" not in str(in_shadow)
+    # And the events themselves are one unbroken, cleanly closed chain.
+    (chain,), unchained = audit.verify(raw_audits)
+    assert chain.problems == [] and chain.closed and unchained == 0
+    assert chain.events == len(raw_audits) == connector.audit_events
 
 
 @pytest.mark.skipif(not KAFKA_CONTAINER, reason="SAFESTREAM_IT_KAFKA_CONTAINER not set")

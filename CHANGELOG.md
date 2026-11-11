@@ -14,6 +14,11 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - An unknown `LOG_LEVEL` falls back to `INFO` with a warning instead of a traceback.
 
 ### Added
+- Shadow mode: a signed candidate policy (`SAFESTREAM_SHADOW_POLICY_FILE`) is evaluated beside
+  the policy in force and compared as counts, in metrics and audit events. Its output is never
+  published.
+- Audit events are `safestream.audit/v2`: each carries its place in a per-run hash chain.
+  `safestream-audit verify` detects altered, removed, reordered or replayed events.
 - Signed policy bundles: `safestream-policy keygen/sign/verify`, `SAFESTREAM_POLICY_FILE` and
   `SAFESTREAM_POLICY_PUBLIC_KEYS`. The connector verifies the Ed25519 signature, adopts a newer
   version between batches without a restart, and refuses forged, rolled-back, wrong-tenant or
@@ -38,6 +43,8 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - `LICENSE`, `SECURITY.md`, `CODEOWNERS` and this changelog.
 
 ### Changed
+- Audit event schema is now `safestream.audit/v2` (adds `chain`, `shadow` and `policy`; no
+  field was removed).
 - New dependency: `cryptography` (Ed25519).
 - The field-rules ConfigMap is named `<release name>-field-rules` (was
   `safestream-field-rules`), and the pods roll when the rules change.

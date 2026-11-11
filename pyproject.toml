@@ -40,6 +40,7 @@ safestream-kafka = "safestream_enterprise.connectors.kafka:main"
 safestream-batch = "safestream_enterprise.batch:main"
 safestream-dlq = "safestream_enterprise.dlq:main"
 safestream-policy = "safestream_enterprise.policy:main"
+safestream-audit = "safestream_enterprise.audit:main"
 
 [tool.hatch.version]
 path = "src/safestream_enterprise/__init__.py"

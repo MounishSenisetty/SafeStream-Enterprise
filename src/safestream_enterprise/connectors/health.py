@@ -25,7 +25,7 @@ import time
 from bisect import bisect_left
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 #: Socket read timeout per connection, so a stalled client cannot pin a thread.
 _REQUEST_TIMEOUT_S = 5.0
@@ -93,6 +93,8 @@ class ConnectorMetrics(NamedTuple):
     #: Version of the signed policy in force; ``None`` when rules are unsigned.
     policy_version: int | None = None
     policy_rejections: int = 0
+    #: Shadow evaluation of a candidate policy (``Shadow.report()``), if one is running.
+    shadow: dict[str, Any] | None = None
     assigned_partitions: int = 0
     batch_seconds: Histogram | None = None
     record_seconds: Histogram | None = None
@@ -152,6 +154,27 @@ def render_metrics(m: ConnectorMetrics, now: float) -> str:
             "(bad signature, rollback, wrong tenant, invalid rules).",
             "# TYPE safestream_policy_rejections_total counter",
             f"safestream_policy_rejections_total {m.policy_rejections}",
+        ]
+    if m.shadow is not None:
+        lines += [
+            "# HELP safestream_shadow_policy_version Candidate policy being evaluated in shadow.",
+            "# TYPE safestream_shadow_policy_version gauge",
+            f"safestream_shadow_policy_version {m.shadow['candidate']['version']}",
+            "# HELP safestream_shadow_records_total Records also redacted under the candidate.",
+            "# TYPE safestream_shadow_records_total counter",
+            f"safestream_shadow_records_total {m.shadow['records']}",
+            "# HELP safestream_shadow_changed_records_total Records whose output would "
+            "differ under the candidate.",
+            "# TYPE safestream_shadow_changed_records_total counter",
+            f"safestream_shadow_changed_records_total {m.shadow['changed_records']}",
+            "# HELP safestream_shadow_redactions_total Redactions on shadowed records, "
+            "under the policy in force and under the candidate.",
+            "# TYPE safestream_shadow_redactions_total counter",
+        ]
+        lines += [
+            f'safestream_shadow_redactions_total{{policy="{which}",entity_type="{t}"}} {n}'
+            for which in ("active", "candidate")
+            for t, n in m.shadow["redactions"][which].items()
         ]
     if m.batch_seconds is not None:
         lines += m.batch_seconds.render(
