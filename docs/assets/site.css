@@ -1,0 +1,204 @@
+/* Brand colours and the landing page. Everything else is the theme's own. */
+:root {
+  --ss-ink: #0f1b2d;
+  --ss-accent: #0f9d8a;
+  --md-primary-fg-color: var(--ss-ink);
+  --md-primary-fg-color--light: #1c2f4a;
+  --md-primary-fg-color--dark: #0a1422;
+  --md-accent-fg-color: var(--ss-accent);
+}
+[data-md-color-scheme="slate"] {
+  --md-accent-fg-color: #35c9b4;
+  --md-typeset-a-color: #35c9b4;
+}
+/* The theme draws outline buttons in the primary colour, which is the dark ink. */
+[data-md-color-scheme="slate"] .md-typeset .md-button:not(.md-button--primary) {
+  border-color: #35c9b4;
+  color: #35c9b4;
+}
+[data-md-color-scheme="default"] {
+  --md-typeset-a-color: #0b7a6c;
+}
+
+.ss-hero {
+  background: var(--ss-ink);
+  color: #fff;
+}
+.ss-hero__inner {
+  padding: 3.2rem 1.2rem 3.6rem;
+}
+.ss-eyebrow {
+  margin: 0 0 0.8rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #6fe0cf;
+}
+.ss-hero h1 {
+  margin: 0;
+  max-width: 22ch;
+  font-size: clamp(1.7rem, 4.6vw, 2.8rem);
+  font-weight: 700;
+  line-height: 1.12;
+  letter-spacing: -0.02em;
+  color: #fff;
+}
+.ss-lede {
+  max-width: 62ch;
+  margin: 1.2rem 0 0;
+  font-size: 0.85rem;
+  line-height: 1.6;
+  color: #c9d3e0;
+}
+.ss-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin: 1.6rem 0 0;
+}
+.ss-hero .md-button {
+  /* Outside the article, so the theme's button styles do not apply here. */
+  display: inline-block;
+  padding: 0.6rem 1.3rem;
+  border: 2px solid #5b6f8a;
+  border-radius: 0.2rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: #fff;
+  transition: background-color 125ms, border-color 125ms, color 125ms;
+}
+.ss-hero .md-button--primary {
+  background: var(--ss-accent);
+  border-color: var(--ss-accent);
+  color: #fff;
+}
+.ss-hero .md-button:is(:hover, :focus-visible) {
+  background: #fff;
+  border-color: #fff;
+  color: var(--ss-ink);
+}
+
+.ss-flow {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr auto 1fr;
+  align-items: stretch;
+  gap: 0.6rem;
+  margin-top: 2.6rem;
+}
+.ss-flow__node {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  min-width: 0;
+  padding: 0.9rem 1rem;
+  border: 1px solid #2c4160;
+  border-radius: 0.4rem;
+  background: #14243a;
+}
+.ss-flow__node--core {
+  justify-content: center;
+  border-color: var(--ss-accent);
+  background: #10302f;
+}
+.ss-flow__label {
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #9fb0c6;
+}
+.ss-flow__node--core .ss-flow__label {
+  color: #6fe0cf;
+}
+.ss-flow__checks {
+  font-size: 0.72rem;
+  color: #dfe7f1;
+}
+.ss-flow code {
+  padding: 0;
+  background: none;
+  font-size: 0.66rem;
+  line-height: 1.5;
+  color: #e6edf6;
+  overflow-wrap: anywhere;
+}
+.ss-flow__arrow {
+  align-self: center;
+  width: 1.6rem;
+  height: 2px;
+  background: #5b6f8a;
+  position: relative;
+}
+.ss-flow__arrow::after {
+  content: "";
+  position: absolute;
+  right: 0;
+  top: -4px;
+  border-left: 7px solid #5b6f8a;
+  border-top: 5px solid transparent;
+  border-bottom: 5px solid transparent;
+}
+
+.ss-section {
+  margin: 2.6rem 0;
+}
+.ss-section h2 {
+  margin: 0 0 1.2rem;
+  font-size: 1.25rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.ss-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 0.9rem;
+}
+.ss-card {
+  padding: 1.1rem 1.2rem;
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: 0.4rem;
+  background: var(--md-default-bg-color);
+}
+.ss-card h3 {
+  margin: 0 0 0.5rem;
+  font-size: 0.86rem;
+  font-weight: 700;
+}
+.ss-card p {
+  margin: 0.4rem 0 0;
+  font-size: 0.74rem;
+  line-height: 1.6;
+}
+.ss-step {
+  margin: 0 0 0.5rem !important;
+  font-size: 0.62rem !important;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--md-typeset-a-color);
+}
+.ss-section--plain p {
+  max-width: 62ch;
+  font-size: 0.78rem;
+}
+
+@media (max-width: 52rem) {
+  .ss-flow {
+    grid-template-columns: 1fr;
+  }
+  .ss-flow__arrow {
+    justify-self: center;
+    width: 2px;
+    height: 1.2rem;
+  }
+  .ss-flow__arrow::after {
+    right: -4px;
+    top: auto;
+    bottom: 0;
+    border-top: 7px solid #5b6f8a;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-bottom: 0;
+  }
+}

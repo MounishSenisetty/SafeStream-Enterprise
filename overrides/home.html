@@ -1,0 +1,95 @@
+{% extends "main.html" %}
+
+{% block tabs %}
+  {{ super() }}
+  <section class="ss-hero">
+    <div class="ss-hero__inner md-grid">
+      <p class="ss-eyebrow">Streaming data redaction, self-hosted</p>
+      <h1>Stop sensitive data at the pipe, before it lands in your data lake.</h1>
+      <p class="ss-lede">
+        SafeStream Enterprise removes personal data, payment data and credentials from your
+        Kafka streams in flight. Raw records come in, clean records go out, and nothing
+        sensitive reaches the place where it would become a breach or an audit finding.
+      </p>
+      <p class="ss-actions">
+        <a class="md-button md-button--primary" href="guide/">Read the documentation</a>
+        <a class="md-button" href="guide/#deploy-in-minutes">Deploy in minutes</a>
+      </p>
+
+      <div class="ss-flow" role="img"
+           aria-label="Raw events flow from your services through SafeStream to a clean topic; records that cannot be processed go to a restricted dead-letter topic.">
+        <div class="ss-flow__node">
+          <span class="ss-flow__label">Your services</span>
+          <code>{"LastName": "Smith", "msg": "mail bob@corp.example"}</code>
+        </div>
+        <div class="ss-flow__arrow" aria-hidden="true"></div>
+        <div class="ss-flow__node ss-flow__node--core">
+          <span class="ss-flow__label">SafeStream, in your cluster</span>
+          <span class="ss-flow__checks">field rules + content detection</span>
+        </div>
+        <div class="ss-flow__arrow" aria-hidden="true"></div>
+        <div class="ss-flow__node">
+          <span class="ss-flow__label">Clean topic</span>
+          <code>{"LastName": "[REDACTED]", "msg": "mail [REDACTED]"}</code>
+        </div>
+      </div>
+    </div>
+  </section>
+{% endblock %}
+
+{% block content %}
+  <section class="ss-section">
+    <h2>Built for the way data actually leaks</h2>
+    <div class="ss-grid">
+      <article class="ss-card">
+        <h3>Your data never leaves your network</h3>
+        <p>Fully self-hosted on Kubernetes. No SaaS round trip, no vendor cloud, no telemetry
+          carrying record content. A default-deny network policy limits each pod to your brokers.</p>
+      </article>
+      <article class="ss-card">
+        <h3>Accurate on structured data</h3>
+        <p>Every JSON or XML record is parsed and redacted by field name and by content, so
+          <code>"LastName": "Smith"</code> is caught even though the value matches no pattern.</p>
+      </article>
+      <article class="ss-card">
+        <h3>Fails closed</h3>
+        <p>A record that cannot be processed goes to an access-restricted dead-letter topic,
+          never to the clean one. Exactly-once delivery when you need it.</p>
+      </article>
+    </div>
+  </section>
+
+  <section class="ss-section">
+    <h2>Change policy without holding your breath</h2>
+    <div class="ss-grid">
+      <article class="ss-card">
+        <p class="ss-step">1 &middot; Sign</p>
+        <h3>Rules that cannot be quietly weakened</h3>
+        <p>Redaction rules ship as signed policy bundles. A connector obeys only a trusted
+          signature and a newer version; a forged or rolled-back bundle changes nothing.</p>
+        <p><a href="guide/#signed-policy-bundles">Signed policy bundles</a></p>
+      </article>
+      <article class="ss-card">
+        <p class="ss-step">2 &middot; Shadow</p>
+        <h3>See the effect before it applies</h3>
+        <p>A candidate policy runs beside the live one on real traffic. You get the difference
+          as counts, by data type, and nobody has to look at the data.</p>
+        <p><a href="guide/#shadow-mode-try-a-policy-before-it-applies">Shadow mode</a></p>
+      </article>
+      <article class="ss-card">
+        <p class="ss-step">3 &middot; Prove</p>
+        <h3>Evidence an auditor can check</h3>
+        <p>Content-free audit events record what was removed, under which policy, in a hash
+          chain that shows any event altered, removed or reordered.</p>
+        <p><a href="guide/#compliance-audit-events">Audit events</a></p>
+      </article>
+    </div>
+  </section>
+
+  <section class="ss-section ss-section--plain">
+    <h2>Measured, not estimated</h2>
+    <p>Throughput per core, end-to-end numbers through Kafka and where the time goes are
+      published with the script that produced them. Run it on your own hardware.</p>
+    <p><a class="md-button" href="benchmarks/">See the benchmarks</a></p>
+  </section>
+{% endblock %}

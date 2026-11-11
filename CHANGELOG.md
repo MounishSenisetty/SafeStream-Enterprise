@@ -14,6 +14,10 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - An unknown `LOG_LEVEL` falls back to `INFO` with a warning instead of a traceback.
 
 ### Added
+- `infra/cloudflare`: Terraform for safestreamdata.com (DNSSEC, TLS and HSTS settings, CAA,
+  anti-spoofing mail records, firewall and rate-limit rules, Pages, D1 and R2), validated in
+  CI and applied by the `Deploy` workflow after approval.
+- The public site: a landing page plus this documentation, built with MkDocs.
 - Shadow mode: a signed candidate policy (`SAFESTREAM_SHADOW_POLICY_FILE`) is evaluated beside
   the policy in force and compared as counts, in metrics and audit events. Its output is never
   published.

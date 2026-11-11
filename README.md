@@ -536,6 +536,8 @@ SafeStream-Enterprise/
 │   ├── helm/safestream-enterprise/     # the chart: source of truth for everything below
 │   ├── kubernetes/                     # manifests rendered from the chart by render.sh
 │   └── e2e/                            # chart test on a kind cluster (CI)
+├── infra/cloudflare/                   # Terraform for safestreamdata.com (see its README)
+├── docs/, overrides/, mkdocs.yml       # the public site: landing page + this documentation
 ├── src/safestream_enterprise/
 │   ├── batch.py                        # safestream-batch: backfill files / stdin
 │   ├── dlq.py                          # safestream-dlq: summarise and replay the DLQ
@@ -595,6 +597,17 @@ from (Dependabot keeps the pins in it current otherwise):
 ```bash
 uv pip compile pyproject.toml --generate-hashes --python-version 3.13 -o requirements.txt
 ```
+
+The public site at safestreamdata.com is this README, `SECURITY.md`, `CHANGELOG.md` and
+`docs/` built with MkDocs. Preview it locally:
+
+```bash
+pip install -e ".[docs]" && mkdocs serve
+```
+
+Cloudflare infrastructure is Terraform in `infra/cloudflare`; see
+[its README](infra/cloudflare/README.md) for the one-time setup. CI validates it on every
+change, and the `Deploy` workflow plans and applies it.
 
 ### Releasing
 

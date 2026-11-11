@@ -1,0 +1,99 @@
+# Cloudflare: infrastructure (Terraform) and the public site (Pages).
+#
+# Off until the repository variable CLOUDFLARE_ENABLED is "true" and the
+# secrets in infra/cloudflare/README.md exist. Then:
+#   pull request  -> terraform plan, shown in the job log
+#   push to main  -> plan, then apply and site deploy once a reviewer approves
+#                    the "cloudflare" environment (configure required reviewers
+#                    on it: without them the apply runs unattended).
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths: ["infra/**", "docs/**", "overrides/**", "mkdocs.yml", "README.md", "SECURITY.md", "CHANGELOG.md", ".github/workflows/deploy.yml"]
+  pull_request:
+    paths: ["infra/**", ".github/workflows/deploy.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One Terraform run at a time against the shared state; never cancel an apply.
+concurrency:
+  group: cloudflare
+  cancel-in-progress: false
+
+env:
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  TF_VAR_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  # R2 API token for the state bucket (S3-compatible credentials).
+  AWS_ACCESS_KEY_ID: ${{ secrets.TFSTATE_R2_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.TFSTATE_R2_SECRET_ACCESS_KEY }}
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  plan:
+    name: terraform plan
+    if: vars.CLOUDFLARE_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.13.5"
+      - name: terraform init
+        working-directory: infra/cloudflare
+        env:
+          ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: >-
+          terraform init
+          -backend-config="bucket=${{ vars.TFSTATE_BUCKET || 'safestream-tfstate' }}"
+          -backend-config="endpoints={s3=\"https://${ACCOUNT_ID}.r2.cloudflarestorage.com\"}"
+      - run: terraform -chdir=infra/cloudflare plan -lock-timeout=5m
+
+  apply:
+    name: terraform apply
+    needs: plan
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: cloudflare
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.13.5"
+      - name: terraform init
+        working-directory: infra/cloudflare
+        env:
+          ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: >-
+          terraform init
+          -backend-config="bucket=${{ vars.TFSTATE_BUCKET || 'safestream-tfstate' }}"
+          -backend-config="endpoints={s3=\"https://${ACCOUNT_ID}.r2.cloudflarestorage.com\"}"
+      # ponytail: plans again instead of applying the reviewed plan file; state is
+      # locked and changes are rare. Pass the plan as an artifact if that gap matters.
+      - run: terraform -chdir=infra/cloudflare apply -auto-approve -lock-timeout=5m
+
+  site:
+    name: deploy the public site
+    needs: apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install "mkdocs-material==9.8.1"
+      - run: mkdocs build
+        env:
+          NO_MKDOCS_2_WARNING: "1"
+      - name: upload to Cloudflare Pages
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx --yes wrangler@4.160.0 pages deploy site --project-name=safestream-site --branch=main

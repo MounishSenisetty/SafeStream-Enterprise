@@ -132,6 +132,37 @@ jobs:
           -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
           /deploy/kubernetes/
 
+  infra:
+    name: Terraform (Cloudflare) format and validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: "1.13.5"
+      - run: terraform fmt -check -recursive infra
+      # No credentials and no state: this checks the configuration against the
+      # provider's schema. Planning against the account is in deploy.yml.
+      - run: terraform -chdir=infra/cloudflare init -backend=false -input=false
+      - run: terraform -chdir=infra/cloudflare validate
+
+  site:
+    name: build the public site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: pip install "mkdocs-material==9.8.1"
+      # strict: a broken link or include fails the build.
+      - run: mkdocs build
+        env:
+          NO_MKDOCS_2_WARNING: "1"
+
   e2e:
     name: Helm chart on Kubernetes (kind)
     runs-on: ubuntu-latest
