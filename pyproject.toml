@@ -20,7 +20,7 @@ dependencies = [
   # The open-source engine: detection tiers, redaction policies, streaming core.
   # Pinned to the minor series whose public API (Redactor, RedactionPolicy,
   # Detection, RedactionStats) this package is written against.
-  "safestream-redactor>=0.4.0,<0.5",
+  "safestream-redactor>=0.4.0,<0.6",
   # Kafka connector; librdkafka is bundled inside the wheel.
   "confluent-kafka>=2.3,<3",
   # Validated, secret-safe connector configuration.
