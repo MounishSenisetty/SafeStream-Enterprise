@@ -9,7 +9,7 @@
 # Both base images are pinned by multi-arch index digest (amd64 + arm64), so a
 # rebuild of the same commit gets the same bases; Dependabot proposes updates.
 
-FROM python:3.11-slim-bookworm@sha256:94a8fee35252d06ab75856f15f12c7bae67b10e8a6da93c7fded82b2610926cd AS build
+FROM python:3.11-slim-bookworm@sha256:a83ba18aef0f865b1a4a611c2cf460fe446f2795673bbb9fe43be570439e3b39 AS build
 ENV PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1
 WORKDIR /src
 COPY pyproject.toml README.md ./
