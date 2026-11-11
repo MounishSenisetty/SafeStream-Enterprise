@@ -5,6 +5,9 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 ## Unreleased
 
 ### Fixed
+- Kafka connector: a watchdog exits the process (code 3) when the main loop stalls. After a
+  broker crash, a transactional client call could block indefinitely, past its timeout,
+  leaving a connector that consumed nothing until something outside restarted it.
 - Kafka connector: a record the clean topic rejects for good (`MSG_SIZE_TOO_LARGE`,
   `INVALID_RECORD`, `INVALID_TIMESTAMP`) is now dead-lettered. Before, the connector exited and
   replayed the same record on every restart, in both delivery modes.

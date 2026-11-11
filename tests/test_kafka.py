@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ from safestream_enterprise.connectors.kafka import (
     DeliveryError,
     KafkaRedactionConnector,
     main,
+    watchdog,
 )
 
 
@@ -488,3 +490,19 @@ def test_transient_broker_failure_is_never_dead_lettered() -> None:
     with pytest.raises(DeliveryError):
         conn.process_batch([FakeMsg(b'{"a": 1}')])  # type: ignore[list-item]
     assert c.commits == 0 and all(m["topic"] == "egress-logs-clean" for m in p.sent)
+
+
+def test_watchdog_exits_only_when_the_main_loop_has_stalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn, _ = make(FakeProducer())
+    checks = iter(range(3))
+
+    def fresh_then_stale(_s: float) -> None:
+        # Two healthy checks, then the loop stops advancing.
+        conn.heartbeat = time.monotonic() - (0 if next(checks) < 2 else 999)
+
+    monkeypatch.setattr(time, "sleep", fresh_then_stale)
+    codes: list[int] = []
+    watchdog(conn, timeout_s=120, exit_process=codes.append)
+    assert codes == [3]

@@ -223,7 +223,7 @@ with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
 | `SAFESTREAM_AUDIT_TOPIC` | none | Topic for compliance audit events; unset turns auditing off. See [Compliance audit events](#compliance-audit-events) |
 | `SAFESTREAM_AUDIT_INTERVAL_S` | `60` | Seconds per audit window (minimum 1) |
 | `SAFESTREAM_METRICS_PORT` | `9400` | Port for `/healthz`, `/readyz` and `/metrics`; `0` turns the endpoint off. See [Monitoring](#monitoring) |
-| `SAFESTREAM_LIVENESS_TIMEOUT_S` | `120` | `/healthz` fails once the main loop hasn't advanced for this long. Must be at least twice `SAFESTREAM_FLUSH_TIMEOUT_S` |
+| `SAFESTREAM_LIVENESS_TIMEOUT_S` | `120` | Once the main loop hasn't advanced for this long, `/healthz` fails and the connector exits with code 3 to be restarted. Must be at least twice `SAFESTREAM_FLUSH_TIMEOUT_S` |
 | `SAFESTREAM_TRANSACTIONAL_ID` | `<group id>-<hostname>` | Exactly-once only. The default (the pod name on Kubernetes) is unique per instance, which is all exactly-once needs |
 | `SAFESTREAM_BATCH_SIZE` | `500` | Records per commit (per transaction in exactly-once mode) |
 | `SAFESTREAM_FLUSH_TIMEOUT_S` | `30` | Maximum wait for egress acknowledgements per batch |
@@ -376,6 +376,11 @@ requests. The NetworkPolicy lets only the `monitoring` namespace reach the port.
   DLQ while the consumer keeps running. If the brokers fail to acknowledge a batch, the
   consumer exits without committing offsets, and Kubernetes restarts it from the last safe
   point. In none of these cases does an unredacted record reach the clean topic.
+- **No silent stalls.** A Kafka client call can block far past its own timeout after a broker
+  crash. A watchdog exits the process (code 3) when the main loop has not advanced for
+  `SAFESTREAM_LIVENESS_TIMEOUT_S`, so it is restarted and resumes from the last committed
+  offset, with or without Kubernetes probing it. Exit codes: 0 clean stop, 1 Kafka error,
+  2 invalid configuration, 3 stalled.
 - **No poison pills.** A record the clean topic itself rejects for good (too large once
   redacted, or a timestamp the topic refuses) would fail again on every replay. Its original
   goes to the DLQ instead, tagged with the broker's error name (for example

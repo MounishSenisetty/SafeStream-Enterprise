@@ -62,8 +62,9 @@ import os
 import signal
 import socket
 import sys
+import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from types import FrameType
@@ -836,8 +837,42 @@ def build_redactor(config: ConnectorConfig) -> StructuredRedactor:
     return redactor
 
 
+#: Exit code when the watchdog ends a stalled process.
+EXIT_STALLED = 3
+
+
+def watchdog(
+    connector: KafkaRedactionConnector,
+    timeout_s: float,
+    interval_s: float = 5.0,
+    exit_process: Callable[[int], None] = os._exit,
+) -> None:
+    """Exit the process once the main loop has not advanced for ``timeout_s``.
+
+    A Kafka client call can block far past its own timeout (seen in
+    ``send_offsets_to_transaction`` after a broker crash). Nothing in-process
+    can interrupt it, so the only recovery is a restart, and exiting is safe:
+    offsets are uncommitted and an open transaction is aborted by the next
+    instance. ``/healthz`` reports the same condition to Kubernetes; this makes
+    it hold where nothing is probing (``docker run``, the metrics port turned off).
+    """
+    while True:
+        time.sleep(interval_s)
+        age = time.monotonic() - connector.heartbeat
+        if age > timeout_s:
+            logger.critical(
+                "main loop stalled for %.0fs (a Kafka client call did not return); "
+                "exiting for restart, uncommitted records will be replayed",
+                age,
+            )
+            logging.shutdown()
+            exit_process(EXIT_STALLED)
+            return
+
+
 def main() -> int:
-    """Console entry point (``safestream-kafka``). Exit code 0 on clean stop."""
+    """Console entry point (``safestream-kafka``): 0 clean stop, 1 Kafka error, 2 bad
+    configuration, 3 stalled (see :func:`watchdog`)."""
     configure_logging()
     try:
         config = ConnectorConfig.from_env()
@@ -866,6 +901,12 @@ def main() -> int:
         except OSError as exc:
             logger.error("cannot serve health/metrics on port %d: %s", config.metrics_port, exc)
             return 2
+    threading.Thread(
+        target=watchdog,
+        args=(connector, config.liveness_timeout_s),
+        name="safestream-watchdog",
+        daemon=True,
+    ).start()
     # Kubernetes sends SIGTERM on scale-down/rollout; drain instead of dying mid-batch.
     signal.signal(signal.SIGTERM, connector.stop)
     signal.signal(signal.SIGINT, connector.stop)
