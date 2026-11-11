@@ -90,6 +90,9 @@ class ConnectorMetrics(NamedTuple):
     #: Records between this instance's position and the end of its partitions;
     #: ``None`` until it has a position on at least one.
     lag: int | None = None
+    #: Version of the signed policy in force; ``None`` when rules are unsigned.
+    policy_version: int | None = None
+    policy_rejections: int = 0
     assigned_partitions: int = 0
     batch_seconds: Histogram | None = None
     record_seconds: Histogram | None = None
@@ -139,6 +142,16 @@ def render_metrics(m: ConnectorMetrics, now: float) -> str:
             "instance's partitions (as of its last fetch).",
             "# TYPE safestream_consumer_lag_records gauge",
             f"safestream_consumer_lag_records {m.lag}",
+        ]
+    if m.policy_version is not None:
+        lines += [
+            "# HELP safestream_policy_version Version of the signed policy in force.",
+            "# TYPE safestream_policy_version gauge",
+            f"safestream_policy_version {m.policy_version}",
+            "# HELP safestream_policy_rejections_total Policy bundles refused "
+            "(bad signature, rollback, wrong tenant, invalid rules).",
+            "# TYPE safestream_policy_rejections_total counter",
+            f"safestream_policy_rejections_total {m.policy_rejections}",
         ]
     if m.batch_seconds is not None:
         lines += m.batch_seconds.render(

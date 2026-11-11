@@ -121,6 +121,7 @@ def make_redactor(
     mode: RedactionMode,
     hmac_key: bytes | None = None,
     field_rules_file: str | Path | None = None,
+    rules: Mapping[str, EntityType] | None = None,
 ) -> StructuredRedactor:
     """The redactor every SafeStream Enterprise entry point uses.
 
@@ -129,8 +130,12 @@ def make_redactor(
     from the lake and the same record streamed through Kafka get the same
     pseudonyms, and stay joinable. Raises ``ValueError`` on a bad rules file
     or an invalid mode/key combination.
+
+    ``rules`` is an already-validated rule table (from a signed policy bundle)
+    and takes the place of ``field_rules_file``.
     """
-    rules = load_field_rules(field_rules_file) if field_rules_file else DEFAULT_FIELD_RULES
+    if rules is None:
+        rules = load_field_rules(field_rules_file) if field_rules_file else DEFAULT_FIELD_RULES
     return StructuredRedactor(
         Redactor(
             policy=RedactionPolicy(mode=mode, hmac_key=hmac_key),

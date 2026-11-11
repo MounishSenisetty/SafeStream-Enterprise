@@ -14,6 +14,11 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - An unknown `LOG_LEVEL` falls back to `INFO` with a warning instead of a traceback.
 
 ### Added
+- Signed policy bundles: `safestream-policy keygen/sign/verify`, `SAFESTREAM_POLICY_FILE` and
+  `SAFESTREAM_POLICY_PUBLIC_KEYS`. The connector verifies the Ed25519 signature, adopts a newer
+  version between batches without a restart, and refuses forged, rolled-back, wrong-tenant or
+  invalid bundles while keeping the policy in force. Audit events and metrics report the
+  version; the chart takes `policy.*`; `safestream-batch --policy` verifies the same way.
 - Helm chart (`deploy/helm/safestream-enterprise`), now the source the plain manifests are
   rendered from. Optional KEDA lag-based autoscaling, alert rules and a Grafana dashboard.
   Published as a signed OCI chart on release.
@@ -33,6 +38,7 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - `LICENSE`, `SECURITY.md`, `CODEOWNERS` and this changelog.
 
 ### Changed
+- New dependency: `cryptography` (Ed25519).
 - The field-rules ConfigMap is named `<release name>-field-rules` (was
   `safestream-field-rules`), and the pods roll when the rules change.
 - The image moves to Debian 13 and CPython 3.13 (distroless `python3-debian13`). The Debian 12

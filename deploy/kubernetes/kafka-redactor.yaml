@@ -242,10 +242,12 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            - name: field-rules
+            # The whole directory, not a subPath: a ConfigMap update then reaches
+            # the running pod, which is what lets a new policy apply without a restart.
+            - name: rules
               mountPath: /etc/safestream
               readOnly: true
       volumes:
-        - name: field-rules
+        - name: rules
           configMap:
             name: safestream-kafka-redactor-field-rules

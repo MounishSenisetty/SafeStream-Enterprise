@@ -50,7 +50,7 @@ from typing import BinaryIO
 
 from safestream_redactor import RedactionMode, RedactionStats
 
-from safestream_enterprise import __version__
+from safestream_enterprise import __version__, policy
 from safestream_enterprise.logs import configure_logging
 from safestream_enterprise.parsers.json_ast import StructuredRedactor
 from safestream_enterprise.rules import make_redactor
@@ -220,7 +220,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "-o", "--output", default="-", help="output file or directory, or - for stdout"
     )
-    parser.add_argument("--rules", help="field rules JSON file (same format as the connector)")
+    rules = parser.add_mutually_exclusive_group()
+    rules.add_argument("--rules", help="field rules JSON file (same format as the connector)")
+    rules.add_argument(
+        "--policy",
+        help="signed policy bundle, verified against $SAFESTREAM_POLICY_PUBLIC_KEYS "
+        "(and $SAFESTREAM_POLICY_TENANT / $SAFESTREAM_POLICY_MIN_VERSION if set)",
+    )
     parser.add_argument(
         "--mode",
         choices=[m.value for m in RedactionMode],
@@ -241,7 +247,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     mode = RedactionMode(args.mode)
     hmac_key = os.environ.get("SAFESTREAM_HMAC_KEY")
     try:
-        redactor = make_redactor(mode, hmac_key.encode() if hmac_key else None, args.rules)
+        signed = None
+        if args.policy:
+            # The same checks the connector makes: a backfill must not run on
+            # rules the stream would refuse.
+            signed = policy.verify(
+                Path(args.policy).read_bytes(),
+                policy.parse_public_keys(os.environ.get(policy.PUBLIC_KEYS_ENV, "")),
+                os.environ.get("SAFESTREAM_POLICY_TENANT") or None,
+                int(os.environ.get("SAFESTREAM_POLICY_MIN_VERSION", "1")),
+            ).rules
+        redactor = make_redactor(
+            mode, hmac_key.encode() if hmac_key else None, args.rules, rules=signed
+        )
+    except OSError as exc:
+        logger.error("cannot read %s: %s", exc.filename, exc.strerror)
+        return 2
     except ValueError as exc:
         logger.error("invalid configuration: %s", exc)
         return 2

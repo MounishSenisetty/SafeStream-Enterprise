@@ -59,6 +59,17 @@ spec:
             description: >-
               More than 100,000 records have been waiting for 15 minutes. Add
               replicas (up to the partition count) or enable autoscaling.
+        - alert: SafeStreamPolicyRefused
+          expr: sum(increase(safestream_policy_rejections_total[10m])) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: SafeStream refused a policy bundle.
+            description: >-
+              A bundle with a bad signature, an older version, another tenant
+              or invalid rules was put in place. Redaction continues under the
+              policy already in force. Find out who changed the bundle: this
+              is either a publishing mistake or an attempt to weaken redaction.
         - alert: SafeStreamTransactionAborts
           expr: sum(increase(safestream_transaction_aborts_total[10m])) > 5
           labels:

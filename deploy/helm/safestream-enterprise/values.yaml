@@ -64,6 +64,25 @@ fieldRules: |
     "disable": []
   }
 
+# Signed policy bundle, used in place of fieldRules. The connector obeys only
+# bundles signed by one of publicKeys, adopts a newer version without a restart
+# (about a minute after the ConfigMap changes), and refuses a forged, rolled-back
+# or wrong-tenant bundle while keeping the policy in force. See "Signed policy
+# bundles" in the README.
+#   safestream-policy sign field-rules.json --key signing.key --tenant acme --version 7 -o policy.json
+#   kubectl -n <namespace> create configmap safestream-policy --from-file=policy.json \
+#     --dry-run=client -o yaml | kubectl apply -f -
+policy:
+  # Name of the ConfigMap holding policy.json. Empty: use fieldRules (unsigned).
+  existingConfigMap: ""
+  # Trusted public keys, as printed by "safestream-policy keygen".
+  publicKeys: []
+  # Refuse bundles for any other tenant.
+  tenant: ""
+  # Refuse bundles below this version. Raise it when you retire a policy, so
+  # an old signed bundle cannot be put back after a restart.
+  minVersion: 1
+
 # Compliance audit events: one content-free JSON event per window. Create the
 # topic first, with long retention, and grant this service Write on it.
 audit:

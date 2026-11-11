@@ -28,6 +28,8 @@ dependencies = [
   "pydantic>=2.6,<3",
   # Rust JSON parser/serialiser for the structured redaction hot path.
   "orjson>=3.10,<4",
+  # Ed25519 signatures on policy bundles (the standard library has none).
+  "cryptography>=43",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +39,7 @@ dev = ["pytest>=7", "pytest-cov>=5", "hypothesis>=6.100", "mypy>=1.8", "ruff>=0.
 safestream-kafka = "safestream_enterprise.connectors.kafka:main"
 safestream-batch = "safestream_enterprise.batch:main"
 safestream-dlq = "safestream_enterprise.dlq:main"
+safestream-policy = "safestream_enterprise.policy:main"
 
 [tool.hatch.version]
 path = "src/safestream_enterprise/__init__.py"

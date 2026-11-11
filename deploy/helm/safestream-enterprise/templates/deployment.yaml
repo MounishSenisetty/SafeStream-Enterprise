@@ -24,8 +24,10 @@ spec:
       labels:
         {{- include "safestream.selectorLabels" . | nindent 8 }}
       annotations:
+        {{- if not .Values.policy.existingConfigMap }}
         # Rules are read once at startup: a change must roll the pods.
         checksum/field-rules: {{ .Values.fieldRules | sha256sum }}
+        {{- end }}
         {{- if .Values.metrics.scrapeAnnotations }}
         # /metrics carries counts, never content.
         prometheus.io/scrape: "true"
@@ -84,8 +86,21 @@ spec:
               value: {{ .Values.redaction.unparseable | quote }}
             - name: SAFESTREAM_DELIVERY
               value: {{ .Values.redaction.delivery | quote }}
+            {{- if .Values.policy.existingConfigMap }}
+            - name: SAFESTREAM_POLICY_FILE
+              value: /etc/safestream/policy.json
+            - name: SAFESTREAM_POLICY_PUBLIC_KEYS
+              value: {{ required "policy.publicKeys is required with policy.existingConfigMap" (join "," .Values.policy.publicKeys) | quote }}
+            {{- with .Values.policy.tenant }}
+            - name: SAFESTREAM_POLICY_TENANT
+              value: {{ . | quote }}
+            {{- end }}
+            - name: SAFESTREAM_POLICY_MIN_VERSION
+              value: {{ .Values.policy.minVersion | quote }}
+            {{- else }}
             - name: SAFESTREAM_FIELD_RULES_FILE
               value: /etc/safestream/field-rules.json
+            {{- end }}
             {{- if .Values.audit.topic }}
             - name: SAFESTREAM_AUDIT_TOPIC
               value: {{ .Values.audit.topic | quote }}
@@ -145,13 +160,15 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            - name: field-rules
+            # The whole directory, not a subPath: a ConfigMap update then reaches
+            # the running pod, which is what lets a new policy apply without a restart.
+            - name: rules
               mountPath: /etc/safestream
               readOnly: true
       volumes:
-        - name: field-rules
+        - name: rules
           configMap:
-            name: {{ include "safestream.name" . }}-field-rules
+            name: {{ .Values.policy.existingConfigMap | default (printf "%s-field-rules" (include "safestream.name" .)) }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

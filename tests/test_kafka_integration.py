@@ -18,7 +18,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -30,12 +30,14 @@ from confluent_kafka.admin import (
     ConfigResource,
     NewTopic,
 )
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from safestream_enterprise import DEFAULT_FIELD_RULES, dlq
+from safestream_enterprise import DEFAULT_FIELD_RULES, dlq, policy
 from safestream_enterprise.connectors.kafka import (
     ConnectorConfig,
     KafkaRedactionConnector,
     build_redactor,
+    load_policy,
 )
 
 BOOTSTRAP = os.environ.get("SAFESTREAM_IT_BOOTSTRAP", "")
@@ -322,6 +324,95 @@ def test_dlq_summary_and_replay_through_redaction(topics: dict[str, str]) -> Non
     # No error tag carried back in, and a second run has nothing left to do.
     assert all("x-safestream-error" not in dict(m.headers() or []) for m in clean)
     assert dlq_tool(replay=True, replay_group="b")["replayed"] == 0
+
+
+def test_policy_is_swapped_under_load_without_a_restart(
+    topics: dict[str, str], tmp_path: Path
+) -> None:
+    key, intruder = Ed25519PrivateKey.generate(), Ed25519PrivateKey.generate()
+    path = tmp_path / "policy.json"
+
+    def publish(version: int, rules: dict[str, str], signer: Ed25519PrivateKey = key) -> None:
+        # Write-then-rename, as a ConfigMap volume update does: never a half-written file.
+        staged = tmp_path / "policy.next"
+        staged.write_bytes(policy.sign({"rules": rules}, signer, "acme", version))
+        staged.replace(path)
+
+    publish(1, {})
+    config = ConnectorConfig(
+        bootstrap_servers=BOOTSTRAP,
+        group_id=f"it-connector-{uuid.uuid4().hex[:8]}",
+        ingress_topic=topics["ingress"],
+        egress_topic=topics["egress"],
+        dlq_topic=topics["dlq"],
+        audit_topic=topics["audit"],
+        delivery="exactly_once",
+        policy_file=path,
+        policy_public_keys=policy.encode_public_key(key.public_key()),
+        policy_tenant="acme",
+        policy_reload_s=0.2,
+        poll_timeout_s=0.2,
+        metrics_port=0,
+    )
+    source, verified = load_policy(config)
+    connector = KafkaRedactionConnector(
+        config,
+        build_redactor(config, verified),
+        Consumer(config.consumer_config()),
+        Producer(config.producer_config()),
+        source,
+        verified,
+    )
+    stop = threading.Event()
+
+    def traffic() -> None:  # steady load for the whole test
+        p = Producer({"bootstrap.servers": BOOTSTRAP})
+        while not stop.is_set():
+            p.produce(topics["ingress"], b'{"loyalty_number":"L-4242-77"}')
+            p.poll(0.01)
+        p.flush(30)
+
+    def wait_for(condition: Callable[[], bool], what: str) -> None:
+        deadline = time.monotonic() + 60
+        while not condition():
+            assert time.monotonic() < deadline, f"timed out waiting for {what}"
+            time.sleep(0.05)
+
+    runner = threading.Thread(target=connector.run, daemon=True)
+    feeder = threading.Thread(target=traffic, daemon=True)
+    runner.start()
+    feeder.start()
+    try:
+        wait_for(lambda: connector.egress_records > 50, "records under version 1")
+        publish(2, {"*loyalty_number*": "id_number"})
+        wait_for(lambda: connector.snapshot().policy_version == 2, "version 2 to take effect")
+        mark = connector.egress_records
+        # An attacker with write access to the file, but not the signing key,
+        # tries to switch the rule back off; then replays the old signed bundle.
+        publish(3, {}, signer=intruder)
+        wait_for(lambda: connector.policy_rejections >= 1, "the forged bundle to be refused")
+        publish(1, {})
+        wait_for(lambda: connector.policy_rejections >= 2, "the rollback to be refused")
+        wait_for(lambda: connector.egress_records > mark + 50, "records after the refusals")
+    finally:
+        stop.set()
+        feeder.join(60)
+        connector.stop()
+        runner.join(60)
+    assert not runner.is_alive()
+
+    values = [m.value() for m in drain(topics["egress"], connector.egress_records)]
+    raw, clean = b'{"loyalty_number":"L-4242-77"}', b'{"loyalty_number":"[REDACTED]"}'
+    assert set(values) == {raw, clean}
+    # One switch, at one point: unredacted only before it, redacted ever after,
+    # through the forged bundle and the rollback attempt.
+    switch = values.index(clean)
+    assert set(values[:switch]) == {raw} and set(values[switch:]) == {clean}
+    assert connector.policy is not None and connector.policy.version == 2
+    # Each audit event covers one policy; the swap closed the version-1 window.
+    audits = [json.loads(m.value() or b"{}") for m in drain(topics["audit"], 2, timeout_s=10)]
+    assert [a["policy"]["version"] for a in audits][:2] == [1, 2]
+    assert "id_number" not in audits[0]["redactions"] and audits[1]["redactions"]["id_number"] > 0
 
 
 @pytest.mark.skipif(not KAFKA_CONTAINER, reason="SAFESTREAM_IT_KAFKA_CONTAINER not set")

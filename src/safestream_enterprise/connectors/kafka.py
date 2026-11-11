@@ -93,6 +93,7 @@ from safestream_enterprise.connectors.health import (
 )
 from safestream_enterprise.logs import configure_logging
 from safestream_enterprise.parsers.json_ast import StructuredRedactor
+from safestream_enterprise.policy import Policy, PolicySource, parse_public_keys
 from safestream_enterprise.rules import make_redactor
 
 logger = logging.getLogger("safestream_enterprise.kafka")
@@ -176,6 +177,17 @@ class ConnectorConfig(BaseModel):
     metrics_port: int = Field(default=9400, ge=0, le=65535)
     #: /healthz fails once the main loop has not advanced for this long.
     liveness_timeout_s: float = Field(default=120.0, gt=0)
+    #: Signed policy bundle (see :mod:`safestream_enterprise.policy`), used
+    #: in place of ``field_rules_file`` and re-read while running.
+    policy_file: Path | None = None
+    #: Keys whose signature on a bundle is trusted: comma-separated base64.
+    policy_public_keys: str | None = None
+    #: If set, a bundle for any other tenant is refused.
+    policy_tenant: str | None = Field(default=None, min_length=1)
+    #: Bundles below this version are refused (rollback floor across restarts).
+    policy_min_version: int = Field(default=1, ge=1)
+    #: How often the bundle file is checked for a new version.
+    policy_reload_s: float = Field(default=30.0, gt=0)
     #: Topic for compliance audit events (see :meth:`KafkaRedactionConnector.audit_event`);
     #: ``None`` disables auditing.
     audit_topic: str | None = Field(default=None, min_length=1)
@@ -202,6 +214,15 @@ class ConnectorConfig(BaseModel):
             raise ValueError(
                 f"SAFESTREAM_KAFKA_* may not set {protected}: the delivery guarantees "
                 "depend on them; use the dedicated SAFESTREAM_*/KAFKA_* settings instead"
+            )
+        if self.policy_file and self.field_rules_file:
+            raise ValueError(
+                "set SAFESTREAM_POLICY_FILE or SAFESTREAM_FIELD_RULES_FILE, not both: "
+                "an unsigned rules file beside a signed policy would defeat the signature"
+            )
+        if bool(self.policy_file) != bool(self.policy_public_keys):
+            raise ValueError(
+                "SAFESTREAM_POLICY_FILE and SAFESTREAM_POLICY_PUBLIC_KEYS must be set together"
             )
         if self.transactional_id and self.delivery != "exactly_once":
             raise ValueError(
@@ -243,6 +264,11 @@ class ConnectorConfig(BaseModel):
             "SAFESTREAM_FIELD_RULES_FILE": "field_rules_file",
             "SAFESTREAM_METRICS_PORT": "metrics_port",
             "SAFESTREAM_LIVENESS_TIMEOUT_S": "liveness_timeout_s",
+            "SAFESTREAM_POLICY_FILE": "policy_file",
+            "SAFESTREAM_POLICY_PUBLIC_KEYS": "policy_public_keys",
+            "SAFESTREAM_POLICY_TENANT": "policy_tenant",
+            "SAFESTREAM_POLICY_MIN_VERSION": "policy_min_version",
+            "SAFESTREAM_POLICY_RELOAD_S": "policy_reload_s",
             "SAFESTREAM_AUDIT_TOPIC": "audit_topic",
             "SAFESTREAM_AUDIT_INTERVAL_S": "audit_interval_s",
         }
@@ -302,9 +328,16 @@ class KafkaRedactionConnector:
         redactor: StructuredRedactor,
         consumer: Consumer,
         producer: Producer,
+        policy_source: PolicySource | None = None,
+        policy: Policy | None = None,
     ) -> None:
         self.config = config
         self.redactor = redactor
+        #: Signed policy in force, and where newer ones come from (both or neither).
+        self.policy = policy
+        self._policy_source = policy_source
+        self._policy_due = time.monotonic() + config.policy_reload_s
+        self.policy_rejections = 0
         self.consumer = consumer
         self.producer = producer
         self.stats = RedactionStats()
@@ -354,6 +387,8 @@ class KafkaRedactionConnector:
             audit_failures=self.audit_failures,
             redactions=dict(self.stats.counts),
             lag=self.lag,
+            policy_version=self.policy.version if self.policy else None,
+            policy_rejections=self.policy_rejections,
             assigned_partitions=self.assigned_partitions,
             batch_seconds=self.batch_seconds.copy(),
             record_seconds=self.record_seconds.copy(),
@@ -411,6 +446,7 @@ class KafkaRedactionConnector:
                 if batch:
                     self.process_batch(batch)
                 self._update_lag()
+                self._maybe_reload_policy()
                 self._maybe_audit()
         finally:
             self.ready = False
@@ -424,6 +460,43 @@ class KafkaRedactionConnector:
             self.producer.flush(self.config.flush_timeout_s)
             self.consumer.close()
             logger.info("stopped: %s; dead-lettered=%d", self.stats.summary(), self.dead_lettered)
+
+    # ------------------------------------------------------------------
+    # signed policy
+    # ------------------------------------------------------------------
+
+    def _maybe_reload_policy(self) -> None:
+        """Adopt a newer signed bundle if one has appeared; never a worse one.
+
+        Runs between batches, so a batch is redacted under exactly one policy.
+        A bundle that is refused (bad signature, rollback, wrong tenant, ...)
+        changes nothing: the policy in force stays in force, the refusal is
+        logged and counted, and the file is checked again next time.
+        """
+        if self._policy_source is None or time.monotonic() < self._policy_due:
+            return
+        self._policy_due = time.monotonic() + self.config.policy_reload_s
+        try:
+            new = self._policy_source.load(self.policy)
+            if new is None:
+                return  # the file is the bundle already in force
+            redactor = build_redactor(self.config, new)
+        except ValueError as exc:  # PolicyError; its message holds no rule text
+            self.policy_rejections += 1
+            logger.error("policy bundle refused, keeping the policy in force: %s", exc)
+            return
+        # Close the audit window first, so every audit event describes records
+        # redacted under one policy.
+        self._audit_due = 0.0
+        self._maybe_audit()
+        self.redactor, self.policy = redactor, new
+        logger.info(
+            "policy version %d now in force (tenant=%s, key=%s, %d rules)",
+            new.version,
+            new.tenant,
+            new.key_id,
+            redactor.rule_count,
+        )
 
     # ------------------------------------------------------------------
     # compliance audit events
@@ -464,6 +537,15 @@ class KafkaRedactionConnector:
                 "count": getattr(self.redactor, "rule_count", None),
                 "fingerprint": getattr(self.redactor, "rules_fingerprint", None),
             },
+            "policy": (
+                {
+                    "tenant": self.policy.tenant,
+                    "version": self.policy.version,
+                    "key_id": self.policy.key_id,
+                }
+                if self.policy
+                else None
+            ),
             "window": {
                 "start": start.isoformat(timespec="milliseconds"),
                 "end": end.isoformat(timespec="milliseconds"),
@@ -817,7 +899,32 @@ def _next_offsets(messages: list[Message]) -> list[TopicPartition]:
     return [TopicPartition(topic, part, off + 1) for (topic, part), off in last.items()]
 
 
-def build_redactor(config: ConnectorConfig) -> StructuredRedactor:
+def load_policy(config: ConnectorConfig) -> tuple[PolicySource, Policy] | tuple[None, None]:
+    """The signed policy ``config`` names, verified; ``(None, None)`` if it names none.
+
+    Raises ``ValueError`` (``PolicyError``) if the bundle is refused: a connector
+    told to run a signed policy never starts on anything else.
+    """
+    if not config.policy_file or not config.policy_public_keys:
+        return None, None
+    source = PolicySource(
+        config.policy_file,
+        parse_public_keys(config.policy_public_keys),
+        config.policy_tenant,
+        config.policy_min_version,
+    )
+    policy = source.load()
+    assert policy is not None  # only None when given a current policy
+    logger.info(
+        "policy version %d verified (tenant=%s, key=%s)",
+        policy.version,
+        policy.tenant,
+        policy.key_id,
+    )
+    return source, policy
+
+
+def build_redactor(config: ConnectorConfig, policy: Policy | None = None) -> StructuredRedactor:
     """The structured redactor for ``config``, built by :func:`.rules.make_redactor`.
 
     ``hmac_key`` keys pseudonymize mode so the same customer maps to the same
@@ -829,6 +936,8 @@ def build_redactor(config: ConnectorConfig) -> StructuredRedactor:
     the same rules. Raises ``ValueError`` (``FieldRulesError``) on a bad file.
     """
     key = config.hmac_key.get_secret_value().encode() if config.hmac_key else None
+    if policy is not None:
+        return make_redactor(config.redaction_mode, key, rules=policy.rules)
     redactor = make_redactor(config.redaction_mode, key, config.field_rules_file)
     if config.field_rules_file:
         # Rule count only: a log line must never echo customer schema details
@@ -876,7 +985,8 @@ def main() -> int:
     configure_logging()
     try:
         config = ConnectorConfig.from_env()
-        redactor = build_redactor(config)
+        policy_source, policy = load_policy(config)
+        redactor = build_redactor(config, policy)
     except ValidationError as exc:
         # include_input=False: the rejected value may be a password or key.
         for err in exc.errors(include_input=False, include_url=False):
@@ -891,6 +1001,8 @@ def main() -> int:
         redactor,
         Consumer(config.consumer_config()),
         Producer(config.producer_config()),
+        policy_source,
+        policy,
     )
     health: HealthServer | None = None
     if config.metrics_port:

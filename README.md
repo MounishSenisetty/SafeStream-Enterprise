@@ -220,6 +220,11 @@ with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
 | `SAFESTREAM_UNPARSEABLE` | `dlq` | Payloads that are neither JSON nor XML. `dlq`: send them to the DLQ. `redact_text`: text-redact them and deliver them to egress |
 | `SAFESTREAM_DELIVERY` | `at_least_once` | `at_least_once` or `exactly_once` (one transaction per batch; needs transactional-ID write permission on the brokers) |
 | `SAFESTREAM_FIELD_RULES_FILE` | none | JSON file of customer field rules, usually a mounted ConfigMap. See [Custom field rules](#custom-field-rules) |
+| `SAFESTREAM_POLICY_FILE` | none | Signed policy bundle, used in place of the rules file and re-read while running. See [Signed policy bundles](#signed-policy-bundles) |
+| `SAFESTREAM_POLICY_PUBLIC_KEYS` | none | Keys whose signature is trusted: comma-separated base64, from `safestream-policy keygen`. Required with the policy file |
+| `SAFESTREAM_POLICY_TENANT` | none | Refuse bundles for any other tenant |
+| `SAFESTREAM_POLICY_MIN_VERSION` | `1` | Refuse bundles below this version |
+| `SAFESTREAM_POLICY_RELOAD_S` | `30` | How often the bundle file is checked for a newer version |
 | `SAFESTREAM_AUDIT_TOPIC` | none | Topic for compliance audit events; unset turns auditing off. See [Compliance audit events](#compliance-audit-events) |
 | `SAFESTREAM_AUDIT_INTERVAL_S` | `60` | Seconds per audit window (minimum 1) |
 | `SAFESTREAM_METRICS_PORT` | `9400` | Port for `/healthz`, `/readyz` and `/metrics`; `0` turns the endpoint off. See [Monitoring](#monitoring) |
@@ -274,6 +279,52 @@ from safestream_enterprise import StructuredRedactor, load_field_rules
 redactor = StructuredRedactor(field_rules=load_field_rules("field-rules.json"))
 ```
 
+### Signed policy bundles
+
+A rules file is trusted because of where it is mounted: anyone who can edit that ConfigMap can
+quietly remove a rule, and redaction weakens with no error. A **policy bundle** is the same
+rules with an Ed25519 signature, and the connector obeys only bundles signed by a key you told
+it to trust.
+
+```bash
+safestream-policy keygen policy-signing.key
+```
+
+That writes the private key (mode 0600; keep it off the cluster, in your secret manager) and
+prints the public key to put in `SAFESTREAM_POLICY_PUBLIC_KEYS` (the chart's
+`policy.publicKeys`). Then, for every change to the rules:
+
+```bash
+safestream-policy sign field-rules.json --key policy-signing.key --tenant acme --version 7 -o policy.json
+```
+
+```bash
+kubectl -n safestream create configmap safestream-policy --from-file=policy.json --dry-run=client -o yaml | kubectl apply -f -
+```
+
+- **No restart.** Each connector notices the new file within `SAFESTREAM_POLICY_RELOAD_S` of
+  Kubernetes updating the mount (about a minute in all) and switches between two batches, so
+  every record is redacted under exactly one version. `safestream_policy_version` shows which.
+- **Refused bundles change nothing.** A bundle that is forged or edited after signing, older
+  than (or the same version as) the one in force, for another tenant, or carrying invalid
+  rules is refused. The policy in force stays in force, the refusal is logged without quoting
+  any rule, `safestream_policy_rejections_total` increases, and the `SafeStreamPolicyRefused`
+  alert fires. At startup a refused bundle stops the pod, as a bad rules file does.
+- **Rollback floor.** Versions are compared while a connector runs. A restarted connector
+  accepts any trusted bundle at or above `SAFESTREAM_POLICY_MIN_VERSION`, so raise that when
+  you retire a policy and an old signed bundle cannot be put back.
+- **Key rotation.** A bundle may carry several signatures and several keys may be trusted:
+  trust the new key everywhere, then sign with it, then drop the old key.
+- **Evidence.** Audit events name the policy tenant, version and signing key, and a policy
+  change closes the audit window, so each event covers records redacted under one policy.
+- **Backfills.** `safestream-batch --policy policy.json` verifies the bundle the same way.
+- **Check before publishing.** `safestream-policy verify policy.json` applies the connector's
+  checks and prints the tenant, version, signing key and rule count.
+
+The signature moves trust from "who can edit the ConfigMap" to "who holds the signing key and
+who can change the connector's trusted keys". Keep the trusted keys in configuration that is
+reviewed (the chart values in Git), not next to the bundle.
+
 ### Compliance audit events
 
 With `SAFESTREAM_AUDIT_TOPIC` set, every connector instance publishes one event per window
@@ -290,6 +341,7 @@ from the pipeline itself rather than from scraping logs or keeping metrics for y
   "delivery": "exactly_once",
   "redaction_mode": "pseudonymize",
   "field_rules": {"count": 68, "fingerprint": "sha256:3f1c…"},
+  "policy": {"tenant": "acme", "version": 7, "key_id": "9a41c0de52b7f310"},
   "window": {"start": "2026-11-05T12:00:00.000+00:00", "end": "2026-11-05T12:01:00.000+00:00", "final": false},
   "records": {"egress": 48210, "dlq": 3},
   "redactions": {"email": 9120, "person": 4471, "secret": 37},
@@ -358,6 +410,8 @@ Kubernetes manifest wires them up as probes and for Prometheus scraping.
 | `safestream_record_duration_seconds` | histogram | Time to redact one record and hand it to the producer |
 | `safestream_consumer_lag_records` | gauge | Records not yet consumed on this instance's partitions, as of its last fetch. Absent until it has a position |
 | `safestream_assigned_partitions` | gauge | Ingress partitions assigned to this instance |
+| `safestream_policy_version` | gauge | Version of the signed policy in force (only with a policy bundle) |
+| `safestream_policy_rejections_total` | counter | Policy bundles refused: bad signature, rollback, wrong tenant or invalid rules |
 | `safestream_heartbeat_age_seconds` | gauge | Seconds since the main loop last advanced |
 | `safestream_ready` | gauge | 1 while consuming |
 
@@ -397,6 +451,8 @@ requests. The NetworkPolicy lets only the `monitoring` namespace reach the port.
   runs as non-root on a read-only root filesystem with all Linux capabilities dropped. A
   default-deny NetworkPolicy allows egress only to the Kafka brokers (port 9092) and DNS, and
   ingress only from the `monitoring` namespace to the metrics port.
+- **Rules that cannot be quietly weakened.** With a signed policy bundle, a change to the
+  field rules takes effect only if it carries a trusted signature and a newer version.
 - **No plugin code by default.** Third-party detector plugins are disabled in the service.
 - **Verifiable supply chain.** The image installs its Python dependencies from a lock file
   (`requirements.txt`) that pins every version and checks every wheel's hash. CI audits the
@@ -419,6 +475,7 @@ SafeStream-Enterprise/
 ├── src/safestream_enterprise/
 │   ├── batch.py                        # safestream-batch: backfill files / stdin
 │   ├── dlq.py                          # safestream-dlq: summarise and replay the DLQ
+│   ├── policy.py                       # safestream-policy: signed policy bundles
 │   ├── logs.py                         # LOG_LEVEL / LOG_FORMAT for both entry points
 │   ├── rules.py                        # custom field rules + the shared redactor factory
 │   ├── parsers/
