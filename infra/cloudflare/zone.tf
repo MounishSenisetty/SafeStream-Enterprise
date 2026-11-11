@@ -7,9 +7,12 @@ data "cloudflare_zone" "this" {
 }
 
 locals {
-  zone_id  = data.cloudflare_zone.this.id
-  api_host = "api.${var.zone_name}"
-  www_host = "www.${var.zone_name}"
+  zone_id = data.cloudflare_zone.this.id
+  # Production and staging control plane. One label deep, so the zone's
+  # Universal SSL certificate covers both.
+  api_hosts     = ["api.${var.zone_name}", "api-staging.${var.zone_name}"]
+  api_host_expr = "http.host in {${join(" ", formatlist("\"%s\"", local.api_hosts))}}"
+  www_host      = "www.${var.zone_name}"
 }
 
 # DNSSEC. With Cloudflare as registrar the DS record is published automatically.

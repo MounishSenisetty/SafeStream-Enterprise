@@ -1,0 +1,6 @@
+{
+  "comment": "Test-only key pair. Never used to sign a real policy.",
+  "key_id": "670220a1acb489de",
+  "public_key": "PPeATOS9pqUMmEu4CUZ1MR+HekJ8/Tmqa4BSamDgGgA=",
+  "private_key_pkcs8": "MC4CAQAwBQYDK2VwBCIEIPQZvdWpHnJWnvbBWdlYLvyC8mtKeKCVOSc6Tk5zxdAZ"
+}

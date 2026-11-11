@@ -14,6 +14,10 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - An unknown `LOG_LEVEL` falls back to `INFO` with a warning instead of a traceback.
 
 ### Added
+- `control-plane/`: the control-plane API as a Cloudflare Worker. Tenants with per-tenant
+  signing keys, connector tokens, policy publish/promote/withdraw, policy distribution, and
+  audit-event ingest that anchors each hash chain and refuses anything but content-free
+  fields. Not yet called by connectors.
 - `infra/cloudflare`: Terraform for safestreamdata.com (DNSSEC, TLS and HSTS settings, CAA,
   anti-spoofing mail records, firewall and rate-limit rules, Pages, D1 and R2), validated in
   CI and applied by the `Deploy` workflow after approval.

@@ -15,13 +15,13 @@ resource "cloudflare_ruleset" "waf_custom" {
     {
       ref         = "api_unknown_route"
       description = "API: only published routes"
-      expression  = "(http.host eq \"${local.api_host}\" and not starts_with(http.request.uri.path, \"/v1/\") and http.request.uri.path ne \"/healthz\")"
+      expression  = "(${local.api_host_expr} and not starts_with(http.request.uri.path, \"/v1/\") and http.request.uri.path ne \"/healthz\")"
       action      = "block"
     },
     {
       ref         = "api_unknown_method"
       description = "API: only the methods the API uses"
-      expression  = "(http.host eq \"${local.api_host}\" and not http.request.method in {\"GET\" \"POST\" \"PUT\"})"
+      expression  = "(${local.api_host_expr} and not http.request.method in {\"GET\" \"POST\" \"PUT\"})"
       action      = "block"
     },
     {
@@ -46,7 +46,7 @@ resource "cloudflare_ruleset" "rate_limit" {
     {
       ref         = "api_per_ip"
       description = "API: per-IP ceiling"
-      expression  = "(http.host eq \"${local.api_host}\")"
+      expression  = "(${local.api_host_expr})"
       action      = "block"
       ratelimit = {
         characteristics     = ["ip.src", "cf.colo.id"]

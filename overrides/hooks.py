@@ -23,7 +23,7 @@ def _site_link(match: re.Match[str]) -> str:
     path = match["path"]
     if path in PAGES:
         return f"]({PAGES[path]}{match['anchor'] or ''})"
-    if path.startswith(("deploy/", "src/", "tests/", "bench/", "infra/")):
+    if path.startswith(("deploy/", "src/", "tests/", "bench/", "infra/", "control-plane/")):
         return "](#)"  # a file in the repository: no public page to link to
     return match[0]
 

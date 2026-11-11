@@ -1,0 +1,168 @@
+openapi: 3.1.0
+info:
+  title: SafeStream control plane
+  version: "1"
+  description: >-
+    Signs and distributes redaction policies and keeps what connectors report
+    about themselves. It never receives record content: the one upload route
+    accepts counts, names, versions and hashes, and refuses anything else.
+    A caller's tenant always comes from its token.
+servers:
+  - url: https://api.safestreamdata.com
+  - url: https://api-staging.safestreamdata.com
+components:
+  securitySchemes:
+    platformAdmin: { type: http, scheme: bearer, description: Creates tenants. Held by the operator only. }
+    tenantAdmin: { type: http, scheme: bearer, description: "sst_admin_… token of one tenant." }
+    agent: { type: http, scheme: bearer, description: "sst_agent_… token of one tenant's connectors." }
+  schemas:
+    Error:
+      type: object
+      required: [error, message]
+      properties:
+        error: { type: string, examples: [invalid, unauthenticated, forbidden, not_found, conflict, chain_break] }
+        message: { type: string }
+    FieldRules:
+      type: object
+      additionalProperties: false
+      properties:
+        mode: { enum: [extend, replace] }
+        rules: { type: object, additionalProperties: { type: string, pattern: "^[a-z][a-z0-9_]{0,39}$" }, maxProperties: 1000 }
+        disable: { type: array, items: { type: string, maxLength: 200 } }
+    PolicyBundle:
+      description: Signed bundle, exactly as the connector verifies it (safestream.policy/v1).
+      type: object
+      required: [schema, payload, signatures]
+      properties:
+        schema: { const: safestream.policy/v1 }
+        payload: { type: string, contentEncoding: base64 }
+        signatures:
+          type: array
+          items:
+            type: object
+            required: [key_id, algorithm, signature]
+            properties:
+              key_id: { type: string }
+              algorithm: { const: ed25519 }
+              signature: { type: string, contentEncoding: base64 }
+    AuditEvent:
+      description: >-
+        A safestream.audit/v2 event, byte for byte as the connector published it.
+        Unknown fields are refused.
+      type: object
+  responses:
+    Error:
+      description: Refused. The message names the field, never echoes a value.
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+paths:
+  /healthz:
+    get:
+      summary: Liveness
+      responses: { "200": { description: ok } }
+  /v1/admin/tenants:
+    post:
+      summary: Create a tenant, its signing key and its first admin token
+      security: [{ platformAdmin: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [id, name]
+              properties:
+                id: { type: string, pattern: "^[a-z0-9][a-z0-9-]{1,38}[a-z0-9]$" }
+                name: { type: string, maxLength: 64 }
+      responses:
+        "201": { description: "tenant, admin_token (shown once), key_id, public_key" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/agent-tokens:
+    post:
+      summary: Issue a token for a connector deployment
+      security: [{ tenantAdmin: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, additionalProperties: false, required: [label], properties: { label: { type: string, maxLength: 64 } } }
+      responses:
+        "201": { description: "id, token (shown once), tenant, key_id, public_key" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/tokens:
+    get:
+      summary: List this tenant's tokens (ids and labels, never the tokens)
+      security: [{ tenantAdmin: [] }]
+      responses: { "200": { description: tokens }, default: { $ref: "#/components/responses/Error" } }
+  /v1/tokens/{id}/revoke:
+    post:
+      summary: Revoke a token
+      security: [{ tenantAdmin: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string, pattern: "^[0-9a-f]{12}$" } }]
+      responses: { "200": { description: revoked }, default: { $ref: "#/components/responses/Error" } }
+  /v1/policies:
+    get:
+      summary: Active and candidate versions, and recent policies
+      security: [{ tenantAdmin: [] }]
+      responses: { "200": { description: policies }, default: { $ref: "#/components/responses/Error" } }
+    post:
+      summary: Sign field rules as the next version and make it the candidate
+      description: Connectors evaluate a candidate in shadow; nothing changes until it is promoted.
+      security: [{ tenantAdmin: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [field_rules]
+              properties: { field_rules: { $ref: "#/components/schemas/FieldRules" } }
+      responses:
+        "201": { description: "version, state, key_id, digest, rules" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/policies/{version}/promote:
+    post:
+      summary: Make a version the active policy (must be newer than the active one)
+      security: [{ tenantAdmin: [] }]
+      parameters: [{ name: version, in: path, required: true, schema: { type: integer, minimum: 1 } }]
+      responses: { "200": { description: promoted }, default: { $ref: "#/components/responses/Error" } }
+  /v1/policies/candidate/withdraw:
+    post:
+      summary: Stop offering the candidate
+      security: [{ tenantAdmin: [] }]
+      responses: { "200": { description: withdrawn }, default: { $ref: "#/components/responses/Error" } }
+  /v1/agents:
+    get:
+      summary: Connectors that have reported, with their version and policy
+      security: [{ tenantAdmin: [] }]
+      responses: { "200": { description: agents }, default: { $ref: "#/components/responses/Error" } }
+  /v1/chains:
+    get:
+      summary: Anchored head of every audit chain
+      description: The values to pass to "safestream-audit verify --head".
+      security: [{ tenantAdmin: [] }]
+      responses: { "200": { description: chains }, default: { $ref: "#/components/responses/Error" } }
+  /v1/agent/policy/{which}:
+    get:
+      summary: The active or candidate policy bundle
+      security: [{ agent: [] }]
+      parameters: [{ name: which, in: path, required: true, schema: { enum: [active, candidate] } }]
+      responses:
+        "200": { description: bundle, content: { application/json: { schema: { $ref: "#/components/schemas/PolicyBundle" } } } }
+        "304": { description: Unchanged since the ETag given in If-None-Match }
+        "404": { description: None published }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/agent/telemetry:
+    post:
+      summary: Report one audit event; anchors the connector's audit chain
+      security: [{ agent: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: "#/components/schemas/AuditEvent" } } }
+      responses:
+        "202": { description: "Accepted; head is the new chain head" }
+        "200": { description: Duplicate of the event already at the head }
+        "409": { description: "Does not extend the recorded head; the chain is marked broken" }
+        "422": { description: Not a content-free audit event }
+        default: { $ref: "#/components/responses/Error" }

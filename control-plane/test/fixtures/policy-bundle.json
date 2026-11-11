@@ -1,0 +1,11 @@
+{
+  "schema": "safestream.policy/v1",
+  "payload": "eyJ0ZW5hbnQiOiJhY21lIiwidmVyc2lvbiI6NywiaXNzdWVkX2F0IjoiMjAyNi0xMS0xMVQwOTowMDowMC4wMDBaIiwiZmllbGRfcnVsZXMiOnsibW9kZSI6ImV4dGVuZCIsInJ1bGVzIjp7Iipsb3lhbHR5X251bWJlcioiOiJpZF9udW1iZXIifSwiZGlzYWJsZSI6W119fQ==",
+  "signatures": [
+    {
+      "key_id": "670220a1acb489de",
+      "algorithm": "ed25519",
+      "signature": "i/eXVIZzSra4dTAR9ETnlfg0TU9Pe5mWr9OKJxC0tQ/oqDpGR5xRFKtnSMOm6DujWnUgE7fASVBQ6bZ+ZJkJBA=="
+    }
+  ]
+}

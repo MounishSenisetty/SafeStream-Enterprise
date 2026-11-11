@@ -14,8 +14,8 @@ Terraform for everything on the domain. Nothing here is applied from a laptop: t
 | `storage.tf` | Per environment: a D1 database and R2 buckets for policy bundles and audit evidence; optional write-once lock on production audit evidence |
 
 It does not create the zone (the domain was registered through Cloudflare) and will not
-delete it. The control-plane Worker, the `api` host and Access for the console arrive with
-the phases that build them.
+delete it. The control-plane Worker and its `api` and `api-staging` hosts are deployed by
+Wrangler from `control-plane/`; Access for the console arrives with the console.
 
 ## One-time setup
 
@@ -23,7 +23,8 @@ the phases that build them.
    `safestream-tfstate` and an R2 API token with *Object Read & Write* on that bucket only.
 2. **API token** for Terraform, scoped to this account and zone, with:
    Zone: *Zone Read*, *Zone Settings Edit*, *DNS Edit*, *Zone WAF Edit*, *Dynamic Redirect
-   Edit*; Account: *Cloudflare Pages Edit*, *D1 Edit*, *Workers R2 Storage Edit*.
+   Edit*, *Workers Routes Edit*; Account: *Cloudflare Pages Edit*, *D1 Edit*, *Workers R2
+   Storage Edit*, *Workers Scripts Edit*.
 3. **GitHub**, under Settings → Secrets and variables → Actions:
 
    | Kind | Name | Value |
@@ -31,6 +32,7 @@ the phases that build them.
    | Secret | `CLOUDFLARE_API_TOKEN` | the token from step 2 |
    | Secret | `CLOUDFLARE_ACCOUNT_ID` | the account id |
    | Secret | `TFSTATE_R2_ACCESS_KEY_ID`, `TFSTATE_R2_SECRET_ACCESS_KEY` | the R2 token from step 1 |
+   | Secret | `CONTROL_PLANE_SECRETS_STAGING`, `CONTROL_PLANE_SECRETS_PRODUCTION` | see `control-plane/README.md` |
    | Variable | `CLOUDFLARE_ENABLED` | `true` |
 
 4. **Approval.** Create a GitHub environment named `cloudflare` and add yourself as a

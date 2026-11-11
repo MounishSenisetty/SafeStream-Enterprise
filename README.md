@@ -537,6 +537,7 @@ SafeStream-Enterprise/
 │   ├── kubernetes/                     # manifests rendered from the chart by render.sh
 │   └── e2e/                            # chart test on a kind cluster (CI)
 ├── infra/cloudflare/                   # Terraform for safestreamdata.com (see its README)
+├── control-plane/                      # the control-plane API: a Cloudflare Worker (see its README)
 ├── docs/, overrides/, mkdocs.yml       # the public site: landing page + this documentation
 ├── src/safestream_enterprise/
 │   ├── batch.py                        # safestream-batch: backfill files / stdin

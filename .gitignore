@@ -11,3 +11,5 @@ dist/
 site/
 .terraform/
 *.tfstate*
+node_modules/
+.wrangler/

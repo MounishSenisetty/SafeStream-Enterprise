@@ -147,6 +147,21 @@ jobs:
       - run: terraform -chdir=infra/cloudflare init -backend=false -input=false
       - run: terraform -chdir=infra/cloudflare validate
 
+  control-plane:
+    name: control plane (Workers runtime tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: control-plane
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Node 22 is preinstalled on the runner.
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      # Runs inside workerd with local D1 and R2: the same runtime as production.
+      - run: npm test
+
   site:
     name: build the public site
     runs-on: ubuntu-latest

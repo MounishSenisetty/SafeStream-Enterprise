@@ -11,10 +11,15 @@ name: Deploy
 on:
   push:
     branches: [main]
-    paths: ["infra/**", "docs/**", "overrides/**", "mkdocs.yml", "README.md", "SECURITY.md", "CHANGELOG.md", ".github/workflows/deploy.yml"]
+    paths: ["infra/**", "control-plane/**", "docs/**", "overrides/**", "mkdocs.yml", "README.md", "SECURITY.md", "CHANGELOG.md", ".github/workflows/deploy.yml"]
   pull_request:
     paths: ["infra/**", ".github/workflows/deploy.yml"]
   workflow_dispatch:
+    inputs:
+      production:
+        description: Also deploy the control plane to production (api.safestreamdata.com)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -77,6 +82,45 @@ jobs:
       # ponytail: plans again instead of applying the reviewed plan file; state is
       # locked and changes are rare. Pass the plan as an artifact if that gap matters.
       - run: terraform -chdir=infra/cloudflare apply -auto-approve -lock-timeout=5m
+      - id: outputs
+        run: echo "d1=$(terraform -chdir=infra/cloudflare output -json d1_database_ids)" >> "$GITHUB_OUTPUT"
+    outputs:
+      d1_database_ids: ${{ steps.outputs.outputs.d1 }}
+
+  control-plane:
+    name: deploy the control plane
+    needs: apply
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: cloudflare
+    defaults:
+      run:
+        working-directory: control-plane
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      D1_IDS: ${{ needs.apply.outputs.d1_database_ids }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - name: fill in the D1 database ids from Terraform
+        run: |
+          sed -i "s/D1_ID_STAGING/$(echo "$D1_IDS" | jq -r .staging)/; s/D1_ID_PRODUCTION/$(echo "$D1_IDS" | jq -r .production)/" wrangler.jsonc
+      - name: staging
+        env:
+          SECRETS: ${{ secrets.CONTROL_PLANE_SECRETS_STAGING }}
+        run: |
+          npx wrangler d1 migrations apply safestream-staging --env staging --remote
+          npx wrangler deploy --env staging
+          echo "$SECRETS" | npx wrangler secret bulk --env staging
+      - name: production
+        if: github.event_name == 'workflow_dispatch' && inputs.production
+        env:
+          SECRETS: ${{ secrets.CONTROL_PLANE_SECRETS_PRODUCTION }}
+        run: |
+          npx wrangler d1 migrations apply safestream-production --env production --remote
+          npx wrangler deploy --env production
+          echo "$SECRETS" | npx wrangler secret bulk --env production
 
   site:
     name: deploy the public site

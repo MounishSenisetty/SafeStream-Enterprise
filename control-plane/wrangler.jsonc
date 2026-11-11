@@ -1,0 +1,35 @@
+// SafeStream control plane. Bindings are per environment; the D1 ids are
+// filled in at deploy time from Terraform's outputs (see deploy.yml).
+//   wrangler deploy --env staging
+// Secrets, set once per environment with "wrangler secret put <NAME> --env <env>":
+//   PLATFORM_ADMIN_TOKEN   creates tenants; long and random
+//   KEY_ENCRYPTION_KEY     openssl rand -base64 32; encrypts tenant signing keys
+{
+  "name": "safestream-control-plane",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": false,
+  "observability": { "enabled": true },
+  "env": {
+    "staging": {
+      "routes": [{ "pattern": "api-staging.safestreamdata.com", "custom_domain": true }],
+      "d1_databases": [
+        { "binding": "DB", "database_name": "safestream-staging", "database_id": "D1_ID_STAGING", "migrations_dir": "migrations" }
+      ],
+      "r2_buckets": [
+        { "binding": "POLICIES", "bucket_name": "safestream-staging-policies" },
+        { "binding": "AUDIT", "bucket_name": "safestream-staging-audit" }
+      ]
+    },
+    "production": {
+      "routes": [{ "pattern": "api.safestreamdata.com", "custom_domain": true }],
+      "d1_databases": [
+        { "binding": "DB", "database_name": "safestream-production", "database_id": "D1_ID_PRODUCTION", "migrations_dir": "migrations" }
+      ],
+      "r2_buckets": [
+        { "binding": "POLICIES", "bucket_name": "safestream-production-policies" },
+        { "binding": "AUDIT", "bucket_name": "safestream-production-audit" }
+      ]
+    }
+  }
+}
