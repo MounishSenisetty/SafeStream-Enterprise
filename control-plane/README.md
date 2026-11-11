@@ -12,8 +12,8 @@ event is checked field by field against an allow-list of counts, names, versions
 | For | Routes |
 |---|---|
 | The operator | `POST /v1/admin/tenants`: a tenant, its Ed25519 signing key and its first admin token |
-| A tenant's admins | Issue and revoke connector tokens; publish field rules (signed as the next version, offered to connectors as the **candidate** for shadow evaluation); promote a version to **active**; withdraw a candidate; list connectors and audit-chain heads |
-| Connectors | `GET /v1/agent/policy/active` and `/candidate`; `POST /v1/agent/telemetry` |
+| A tenant's admins | Issue and revoke connector tokens; publish field rules (signed as the next version, offered to connectors as the **candidate** for shadow evaluation); promote a version (a **staged rollout** by default); follow, resume or abort the rollout; withdraw a candidate; list connectors and audit-chain heads |
+| Connectors | `GET /v1/agent/whoami`; `GET /v1/agent/policy/active` and `/candidate`; `POST /v1/agent/telemetry` |
 
 `openapi.yaml` is the full contract; a test keeps it in step with the routes.
 
@@ -28,6 +28,22 @@ event is checked field by field against an allow-list of counts, names, versions
   `safestream-audit verify --head` checks. An event that does not extend the head is kept as
   evidence and the chain is marked broken.
 - **Tokens** are 32 random bytes, stored only as SHA-256 hashes, and shown once.
+- **Staged rollout** (`src/rollout.ts`). Promoting a version hands it to one connector, then
+  to a tenth of the fleet, then to all of it. A connector names itself in
+  `x-safestream-instance` when it fetches the active policy, and the cohort of a stage is the
+  first N connectors seen in the last 10 minutes, ordered by a hash of tenant, version and
+  connector name. A stage ends once every connector in it has reported an audit window under
+  the version and `soak_seconds` (default 600) have passed. It halts on a leak canary, or on a
+  DLQ rate more than one point above the rest of the fleet's (over windows of at least 100
+  records). A halted rollout stays put until it is resumed (the stage starts over) or aborted.
+  Neither can take the version back from connectors that already run it, because connectors
+  refuse older policies. A newer version replaces the rollout.
+
+  ```bash
+  curl -sS https://api.safestreamdata.com/v1/policies/8/promote \
+    -H "authorization: Bearer $ADMIN_TOKEN" -d '{"soak_seconds": 900}'
+  curl -sS https://api.safestreamdata.com/v1/rollout -H "authorization: Bearer $ADMIN_TOKEN"
+  ```
 
 ## Develop
 
@@ -36,7 +52,10 @@ npm ci && npm test
 ```
 
 Tests run inside workerd, the production runtime, with local D1 and R2. Nothing touches
-Cloudflare.
+Cloudflare. CI also runs the Worker with `wrangler dev` and drives a real connector against it
+(`tests/test_control_integration.py` in the repository root). `test/fixtures/audit-event.json`
+is an event as the connector builds it: the Python tests keep it in step with the connector,
+and the tests here must accept it.
 
 ## Deploy
 
@@ -67,9 +86,9 @@ must trust (`SAFESTREAM_POLICY_PUBLIC_KEYS`).
 
 ## Not built yet
 
-- Connectors do not call this API yet; that is the next phase. Until then policies still
-  reach them as files.
 - No web console: the API is the interface.
+- During a rollout, the cohort is recomputed on every active-policy request (a hash per live
+  connector). That is fine for fleets of hundreds; a large fleet would cache it per stage.
 - Telemetry is written in the request, not through a queue. At one event per connector per
   minute that is ample; a queue goes in front when volume calls for it.
 - Field rules are checked for structure here and in full by the connector, which refuses a

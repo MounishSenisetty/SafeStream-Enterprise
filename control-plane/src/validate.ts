@@ -32,7 +32,7 @@ function count(value: unknown, path: string): number {
 const oneOf = <T extends string>(value: unknown, path: string, options: readonly T[]): T =>
   options.includes(value as T) ? (value as T) : fail(path, `must be one of ${options.join(", ")}`);
 
-const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$/; // hostnames, topics, consumer groups, chain ids
+export const NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$/; // hostnames, topics, consumer groups, chain ids
 const ENTITY = /^[a-z][a-z0-9_]{0,39}$/;
 const HASH = /^sha256:[0-9a-f]{64}$/;
 const KEY_ID = /^[0-9a-f]{16}$/;
@@ -62,6 +62,9 @@ export interface AuditEvent {
   shadowVersion: number | null;
   chain: { id: string; seq: number; prev: string | null };
   final: boolean;
+  records: { egress: number; dlq: number };
+  /** Leak canaries in the window; null when the connector runs none (or predates them). */
+  canary: { checks: number; leaks: number } | null;
 }
 
 /** Checks a `safestream.audit/v2` event field by field. Throws {@link Invalid}. */
@@ -69,7 +72,7 @@ export function auditEvent(value: unknown, tenant: string): AuditEvent {
   const e = object(value, "event", [
     "schema", "connector_version", "instance", "group_id", "topics", "delivery", "redaction_mode",
     "field_rules", "policy", "shadow", "chain", "window", "records", "redactions", "batches",
-    "transaction_aborts",
+    "transaction_aborts", "canary",
   ]);
   if (e.schema !== "safestream.audit/v2") fail("event.schema", "must be safestream.audit/v2");
   text(e.group_id, "event.group_id", NAME);
@@ -111,6 +114,11 @@ export function auditEvent(value: unknown, tenant: string): AuditEvent {
   entityCounts(e.redactions, "event.redactions");
   count(e.batches, "event.batches");
   count(e.transaction_aborts, "event.transaction_aborts");
+  let canary: AuditEvent["canary"] = null;
+  if (e.canary !== undefined && e.canary !== null) {
+    const c = object(e.canary, "event.canary", ["checks", "leaks"]);
+    canary = { checks: count(c.checks, "event.canary.checks"), leaks: count(c.leaks, "event.canary.leaks") };
+  }
 
   return {
     instance: text(e.instance, "event.instance", NAME),
@@ -123,6 +131,8 @@ export function auditEvent(value: unknown, tenant: string): AuditEvent {
       prev: chain.prev === null ? null : text(chain.prev, "event.chain.prev", HASH),
     },
     final: window.final as boolean,
+    records: { egress: records.egress as number, dlq: records.dlq as number },
+    canary,
   };
 }
 

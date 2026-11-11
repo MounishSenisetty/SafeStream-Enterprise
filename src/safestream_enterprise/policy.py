@@ -49,7 +49,7 @@ import hashlib
 import json
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -227,30 +227,61 @@ def verify(
     )
 
 
+#: Where bundle bytes come from: returns ``None`` when there is no bundle
+#: (a candidate that was withdrawn, a control plane with nothing published).
+BundleReader = Callable[[], "bytes | None"]
+
+
 class PolicySource:
-    """A bundle file plus the trust settings to check it against."""
+    """Where bundles come from, plus the trust settings to check them against.
+
+    ``origin`` is a bundle file (the usual case: a mounted ConfigMap) or a
+    reader, such as the control-plane client's latest download. Either way the
+    bytes are verified here, by the connector: whatever delivers a bundle is
+    never trusted to have checked it.
+    """
 
     def __init__(
         self,
-        path: str | Path,
+        origin: str | Path | BundleReader,
         trusted: dict[str, Ed25519PublicKey],
         tenant: str | None = None,
         min_version: int = 1,
+        missing_ok: bool = False,
     ) -> None:
-        self.path = Path(path)
+        self.path = None if callable(origin) else Path(origin)
+        self._reader = origin if callable(origin) else None
         self.trusted = trusted
         self.tenant = tenant
         self.min_version = min_version
+        #: A missing file means "no bundle" rather than an error (candidates).
+        self.missing_ok = missing_ok
+
+    def read(self) -> bytes | None:
+        """The bundle's bytes, or ``None`` if there is none. Raises :class:`PolicyError`."""
+        if self._reader is not None:
+            return self._reader()
+        assert self.path is not None
+        try:
+            return self.path.read_bytes()
+        except FileNotFoundError:
+            if self.missing_ok:
+                return None
+            raise PolicyError("cannot read policy bundle: No such file or directory") from None
+        except OSError as exc:
+            raise PolicyError(f"cannot read policy bundle: {exc.strerror}") from None
 
     def load(self, current: Policy | None = None) -> Policy | None:
-        """The policy in the file, or ``None`` if the file is the one already in force.
+        """The policy on offer, or ``None`` if it is the one already in force (or
+        there is none on offer while a policy is in force).
 
         Raises :class:`PolicyError` if it cannot be read or is refused.
         """
-        try:
-            data = self.path.read_bytes()
-        except OSError as exc:
-            raise PolicyError(f"cannot read policy bundle: {exc.strerror}") from None
+        data = self.read()
+        if data is None:
+            if current is not None:
+                return None
+            raise PolicyError("no policy bundle available")
         if current is not None and hashlib.sha256(data).hexdigest() == current.digest:
             return None
         return verify(data, self.trusted, self.tenant, self.min_version, current)

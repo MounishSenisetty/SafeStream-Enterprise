@@ -14,10 +14,23 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - An unknown `LOG_LEVEL` falls back to `INFO` with a warning instead of a traceback.
 
 ### Added
+- Control-plane uplink (`SAFESTREAM_CONTROL_URL`, `SAFESTREAM_CONTROL_TOKEN`, off by default).
+  The connector pulls signed policies and candidates from the control plane and verifies them
+  itself. It pushes its audit events there to anchor the hash chain, outbound HTTPS only. Audit
+  events are checked against a content-free allow-list before they leave. A control-plane
+  outage never stops redaction. `safestream-control check` tries a configuration. The chart
+  takes `control.*`, and its NetworkPolicy opens HTTPS out only when the uplink is enabled.
+- Leak canaries (`SAFESTREAM_CANARY_INTERVAL_S`, default 300 s): synthetic PII through the live
+  redactor, `safestream_canary_leaks_total`, a `canary` field in audit events, and
+  `SAFESTREAM_CANARY_ON_LEAK=stop` (exit code 4).
+- Control plane: staged rollout of promoted policies (one connector, a tenth, everyone) that
+  halts on a leak canary or a DLQ-rate regression; `GET /v1/rollout`, `/abort`, `/resume`;
+  `GET /v1/agent/whoami`. Promotion is now staged unless `{"strategy": "immediate"}`.
+- Alerts `SafeStreamCanaryLeak` and `SafeStreamControlPlaneUnreachable`.
 - `control-plane/`: the control-plane API as a Cloudflare Worker. Tenants with per-tenant
   signing keys, connector tokens, policy publish/promote/withdraw, policy distribution, and
   audit-event ingest that anchors each hash chain and refuses anything but content-free
-  fields. Not yet called by connectors.
+  fields.
 - `infra/cloudflare`: Terraform for safestreamdata.com (DNSSEC, TLS and HSTS settings, CAA,
   anti-spoofing mail records, firewall and rate-limit rules, Pages, D1 and R2), validated in
   CI and applied by the `Deploy` workflow after approval.

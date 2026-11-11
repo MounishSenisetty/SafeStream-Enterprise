@@ -1,7 +1,8 @@
 {{- if .Values.networkPolicy.enabled }}
 # Default-deny for the connector pods. Selecting a pod with both policy types
 # denies all ingress and all egress not explicitly allowed below, so the only
-# reachable destinations are the Kafka brokers and cluster DNS.
+# reachable destinations are the Kafka brokers and cluster DNS (and, only with
+# control.enabled, HTTPS to the control plane).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -46,6 +47,10 @@ spec:
       ports:
         - { protocol: UDP, port: 53 }
         - { protocol: TCP, port: 53 }
+    {{- if .Values.control.enabled }}
+    # The control-plane uplink: outbound HTTPS (see control.egress).
+    {{- toYaml .Values.control.egress | nindent 4 }}
+    {{- end }}
     {{- with .Values.networkPolicy.extraEgress }}
     {{- toYaml . | nindent 4 }}
     {{- end }}

@@ -6,7 +6,8 @@
 // one tenant cannot name another's data.
 
 import { newTenantKey, newToken, sha256Hex, signBundle } from "./crypto";
-import { auditEvent, fieldRules, Invalid, object_, string_, TENANT } from "./validate";
+import { advance, cohort, DEFAULT_SOAK_SECONDS, halt, healthProblem, liveAgents, servedVersion, STAGES, tenantState } from "./rollout";
+import { auditEvent, fieldRules, Invalid, NAME, object_, string_, TENANT } from "./validate";
 
 export interface Env {
   DB: D1Database;
@@ -39,6 +40,9 @@ const now = (): string => new Date().toISOString();
 interface Principal {
   tenant: string;
   kind: "admin" | "agent";
+  /** The token's id (first 12 hex digits of its hash) and label. */
+  id: string;
+  label: string;
 }
 
 function bearer(request: Request): string {
@@ -48,19 +52,21 @@ function bearer(request: Request): string {
 }
 
 async function authenticate(request: Request, env: Env, kind: Principal["kind"]): Promise<Principal> {
+  const hash = await sha256Hex(bearer(request));
   const row = await env.DB.prepare(
-    "SELECT tenant_id, kind FROM tokens WHERE hash = ? AND revoked_at IS NULL",
+    "SELECT tenant_id, kind, label FROM tokens WHERE hash = ? AND revoked_at IS NULL",
   )
-    .bind(await sha256Hex(bearer(request)))
-    .first<{ tenant_id: string; kind: Principal["kind"] }>();
+    .bind(hash)
+    .first<{ tenant_id: string; kind: Principal["kind"]; label: string }>();
   if (!row) throw new HttpError(401, "unauthenticated", "Unknown or revoked token");
   if (row.kind !== kind) throw new HttpError(403, "forbidden", `This route needs a tenant ${kind} token`);
-  return { tenant: row.tenant_id, kind: row.kind };
+  return { tenant: row.tenant_id, kind: row.kind, id: hash.slice(0, 12), label: row.label };
 }
 
-async function body(request: Request): Promise<{ bytes: Uint8Array<ArrayBuffer>; json: unknown }> {
+async function body(request: Request, optional = false): Promise<{ bytes: Uint8Array<ArrayBuffer>; json: unknown }> {
   const bytes = new Uint8Array(await request.arrayBuffer());
   if (bytes.length > MAX_BODY_BYTES) throw new HttpError(413, "too_large", "Request body is too large");
+  if (optional && bytes.length === 0) return { bytes, json: {} };
   try {
     return { bytes, json: JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes)) };
   } catch {
@@ -181,19 +187,100 @@ async function publishPolicy(request: Request, env: Env): Promise<Response> {
 async function promotePolicy(request: Request, env: Env, versionText: string): Promise<Response> {
   const { tenant } = await authenticate(request, env, "admin");
   const version = Number(versionText);
+  const input = object_((await body(request, true)).json, "promote", ["strategy", "soak_seconds"]);
+  const strategy = input.strategy ?? "staged";
+  if (strategy !== "staged" && strategy !== "immediate")
+    throw new Invalid("promote.strategy: must be one of staged, immediate");
+  const soak = input.soak_seconds ?? DEFAULT_SOAK_SECONDS;
+  if (!Number.isSafeInteger(soak) || (soak as number) < 0 || (soak as number) > 7 * 86400)
+    throw new Invalid("promote.soak_seconds: must be an integer from 0 to 604800");
+  const exists = "EXISTS (SELECT 1 FROM policies WHERE tenant_id = ?2 AND version = ?1)";
+  if (strategy === "immediate") {
+    // Everyone at once: for an urgent fix, or a tenant with no connectors yet.
+    // Ends a rollout of this version or an older one.
+    const done = await env.DB.prepare(
+      `UPDATE tenants
+          SET active_version = ?1,
+              candidate_version = CASE WHEN candidate_version <= ?1 THEN NULL ELSE candidate_version END,
+              rollout_version = CASE WHEN rollout_version <= ?1 THEN NULL ELSE rollout_version END,
+              rollout_stage = CASE WHEN rollout_version <= ?1 THEN NULL ELSE rollout_stage END,
+              rollout_stage_started_at = CASE WHEN rollout_version <= ?1 THEN NULL ELSE rollout_stage_started_at END,
+              rollout_soak_seconds = CASE WHEN rollout_version <= ?1 THEN NULL ELSE rollout_soak_seconds END,
+              rollout_halted_reason = CASE WHEN rollout_version <= ?1 THEN NULL ELSE rollout_halted_reason END
+        WHERE id = ?2 AND COALESCE(active_version, 0) < ?1 AND ${exists}`,
+    )
+      .bind(version, tenant)
+      .run();
+    if (!done.meta.changes)
+      throw new HttpError(409, "conflict", "No such version, or it is not newer than the active policy");
+    return json({ version, state: "active" });
+  }
+  // Staged: replaces a rollout of an older version (the usual fix for a halted one).
   const done = await env.DB.prepare(
     `UPDATE tenants
-        SET active_version = ?1,
-            candidate_version = CASE WHEN candidate_version <= ?1 THEN NULL ELSE candidate_version END
-      WHERE id = ?2
-        AND COALESCE(active_version, 0) < ?1
-        AND EXISTS (SELECT 1 FROM policies WHERE tenant_id = ?2 AND version = ?1)`,
+        SET rollout_version = ?1, rollout_stage = 0, rollout_stage_started_at = ?3,
+            rollout_soak_seconds = ?4, rollout_halted_reason = NULL
+      WHERE id = ?2 AND COALESCE(active_version, 0) < ?1 AND COALESCE(rollout_version, 0) < ?1 AND ${exists}`,
   )
-    .bind(version, tenant)
+    .bind(version, tenant, now(), soak)
     .run();
   if (!done.meta.changes)
-    throw new HttpError(409, "conflict", "No such version, or it is not newer than the active policy");
-  return json({ version, state: "active" });
+    throw new HttpError(409, "conflict", "No such version, or it is not newer than the active policy and any rollout");
+  return json({ version, state: "rolling_out", stage: STAGES[0], soak_seconds: soak });
+}
+
+async function rolloutReport(env: Env, tenant: string) {
+  const at = new Date();
+  await advance(env.DB, tenant, at);
+  const { active, rollout } = await tenantState(env.DB, tenant);
+  if (!rollout) return { active_version: active, rollout: null };
+  const live = await liveAgents(env.DB, tenant, at);
+  const members = await cohort(tenant, rollout, live);
+  return {
+    active_version: active,
+    rollout: {
+      version: rollout.version,
+      stage: STAGES[rollout.stage],
+      stage_started_at: rollout.stageStartedAt,
+      soak_seconds: rollout.soakSeconds,
+      halted: rollout.haltedReason !== null,
+      halted_reason: rollout.haltedReason,
+      cohort: members,
+      live_agents: live.length,
+      on_version: live.filter((a) => a.policy_version === rollout.version).length,
+    },
+  };
+}
+
+async function getRollout(request: Request, env: Env): Promise<Response> {
+  const { tenant } = await authenticate(request, env, "admin");
+  return json(await rolloutReport(env, tenant));
+}
+
+async function abortRollout(request: Request, env: Env): Promise<Response> {
+  const { tenant } = await authenticate(request, env, "admin");
+  // Connectors that already run the version keep it: none accepts an older one.
+  const done = await env.DB.prepare(
+    `UPDATE tenants SET rollout_version = NULL, rollout_stage = NULL, rollout_stage_started_at = NULL,
+            rollout_soak_seconds = NULL, rollout_halted_reason = NULL
+      WHERE id = ? AND rollout_version IS NOT NULL`,
+  )
+    .bind(tenant)
+    .run();
+  if (!done.meta.changes) throw new HttpError(409, "conflict", "No rollout in progress");
+  return json(await rolloutReport(env, tenant));
+}
+
+async function resumeRollout(request: Request, env: Env): Promise<Response> {
+  const { tenant } = await authenticate(request, env, "admin");
+  // The stage starts over: its soak time and every connector's report again.
+  const done = await env.DB.prepare(
+    "UPDATE tenants SET rollout_halted_reason = NULL, rollout_stage_started_at = ? WHERE id = ? AND rollout_halted_reason IS NOT NULL",
+  )
+    .bind(now(), tenant)
+    .run();
+  if (!done.meta.changes) throw new HttpError(409, "conflict", "No halted rollout");
+  return json(await rolloutReport(env, tenant));
 }
 
 async function withdrawCandidate(request: Request, env: Env): Promise<Response> {
@@ -212,13 +299,17 @@ async function listPolicies(request: Request, env: Env): Promise<Response> {
       .bind(tenant)
       .all(),
   ]);
-  return json({ ...state, policies: policies.results });
+  const { rollout } = await rolloutReport(env, tenant);
+  return json({ ...state, rollout, policies: policies.results });
 }
 
 async function listAgents(request: Request, env: Env): Promise<Response> {
   const { tenant } = await authenticate(request, env, "admin");
   const { results } = await env.DB.prepare(
-    "SELECT instance, connector_version, policy_version, shadow_version, first_seen_at, last_seen_at FROM agents WHERE tenant_id = ? ORDER BY last_seen_at DESC LIMIT 500",
+    `SELECT instance, connector_version, policy_version, shadow_version, first_seen_at, last_seen_at,
+            window_egress AS egress_records, window_dlq AS dlq_records,
+            window_canary_checks AS canary_checks, window_canary_leaks AS canary_leaks
+       FROM agents WHERE tenant_id = ? ORDER BY last_seen_at DESC LIMIT 500`,
   )
     .bind(tenant)
     .all();
@@ -239,12 +330,31 @@ async function listChains(request: Request, env: Env): Promise<Response> {
 // agents (connectors)
 // ---------------------------------------------------------------------------
 
+async function whoami(request: Request, env: Env): Promise<Response> {
+  const { tenant, id, label } = await authenticate(request, env, "agent");
+  return json({ tenant, id, label });
+}
+
+/** The connector's own name, from the header it sends; null if absent or malformed. */
+function instanceOf(request: Request): string | null {
+  const value = request.headers.get("x-safestream-instance");
+  return value && NAME.test(value) ? value : null;
+}
+
 async function agentPolicy(request: Request, env: Env, which: "active" | "candidate"): Promise<Response> {
   const { tenant } = await authenticate(request, env, "agent");
-  const row = await env.DB.prepare(`SELECT ${which}_version AS version FROM tenants WHERE id = ?`)
-    .bind(tenant)
-    .first<{ version: number | null }>();
-  if (!row?.version) throw new HttpError(404, "not_found", `No ${which} policy`);
+  let version: number | null;
+  if (which === "active") {
+    // Which version this connector gets depends on where a rollout stands.
+    version = await servedVersion(env.DB, tenant, instanceOf(request), new Date());
+  } else {
+    const row = await env.DB.prepare("SELECT candidate_version AS version FROM tenants WHERE id = ?")
+      .bind(tenant)
+      .first<{ version: number | null }>();
+    version = row?.version ?? null;
+  }
+  if (!version) throw new HttpError(404, "not_found", `No ${which} policy`);
+  const row = { version };
   // A version's bundle never changes, so the version is the validator.
   const etag = `"${tenant}-${row.version}"`;
   if (request.headers.get("if-none-match") === etag) return new Response(null, { status: 304, headers: { etag } });
@@ -297,16 +407,35 @@ async function telemetry(request: Request, env: Env): Promise<Response> {
   await env.DB.batch([
     chainUpdate,
     env.DB.prepare(
-      `INSERT INTO agents (tenant_id, instance, first_seen_at, last_seen_at, connector_version, policy_version, shadow_version)
-       VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6)
+      `INSERT INTO agents (tenant_id, instance, first_seen_at, last_seen_at, connector_version, policy_version, shadow_version,
+                           window_reported_at, window_egress, window_dlq, window_canary_checks, window_canary_leaks)
+       VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?3, ?7, ?8, ?9, ?10)
        ON CONFLICT (tenant_id, instance) DO UPDATE SET
-         last_seen_at = ?3, connector_version = ?4, policy_version = ?5, shadow_version = ?6`,
-    ).bind(tenant, event.instance, at, event.connectorVersion, event.policyVersion, event.shadowVersion),
+         last_seen_at = ?3, connector_version = ?4, policy_version = ?5, shadow_version = ?6,
+         window_reported_at = ?3, window_egress = ?7, window_dlq = ?8,
+         window_canary_checks = ?9, window_canary_leaks = ?10`,
+    ).bind(
+      tenant, event.instance, at, event.connectorVersion, event.policyVersion, event.shadowVersion,
+      event.records.egress, event.records.dlq, event.canary?.checks ?? null, event.canary?.leaks ?? null,
+    ),
   ]);
+  await judgeRollout(env, tenant, event.instance);
   if (!extends_)
     // Kept as evidence, but the chain is now marked: something is missing or changed.
     throw new HttpError(409, "chain_break", "Event does not extend the recorded head of its chain");
   return json({ accepted: true, head: hash }, 202);
+}
+
+/** A new window may halt the rollout, or complete its stage. */
+async function judgeRollout(env: Env, tenant: string, instance: string): Promise<void> {
+  const { rollout } = await tenantState(env.DB, tenant);
+  if (!rollout || rollout.haltedReason) return;
+  const at = new Date();
+  const fleet = await liveAgents(env.DB, tenant, at);
+  const agent = fleet.find((a) => a.instance === instance);
+  const problem = agent ? healthProblem(rollout, agent, fleet) : null;
+  if (problem) await halt(env.DB, tenant, rollout.version, problem);
+  else await advance(env.DB, tenant, at);
 }
 
 // ---------------------------------------------------------------------------
@@ -324,8 +453,12 @@ const routes: [method: string, pattern: RegExp, handler: Handler][] = [
   ["GET", /^\/v1\/policies$/, listPolicies],
   ["POST", /^\/v1\/policies\/([1-9][0-9]{0,8})\/promote$/, promotePolicy],
   ["POST", /^\/v1\/policies\/candidate\/withdraw$/, withdrawCandidate],
+  ["GET", /^\/v1\/rollout$/, getRollout],
+  ["POST", /^\/v1\/rollout\/abort$/, abortRollout],
+  ["POST", /^\/v1\/rollout\/resume$/, resumeRollout],
   ["GET", /^\/v1\/agents$/, listAgents],
   ["GET", /^\/v1\/chains$/, listChains],
+  ["GET", /^\/v1\/agent\/whoami$/, whoami],
   ["GET", /^\/v1\/agent\/policy\/(active|candidate)$/, (rq, env, which) => agentPolicy(rq, env, which as "active")],
   ["POST", /^\/v1\/agent\/telemetry$/, telemetry],
 ];

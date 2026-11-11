@@ -89,6 +89,44 @@ policy:
   # an old signed bundle cannot be put back after a restart.
   minVersion: 1
 
+# The SafeStream control plane (api.safestreamdata.com). Off by default: the
+# connector then talks to nothing but the Kafka brokers. On, it pulls its
+# signed policy (and the candidate to shadow) from the control plane and
+# pushes its audit events there, outbound HTTPS only; record content never
+# leaves the cluster. Every bundle is still verified here, with
+# policy.publicKeys, so the control plane cannot weaken or roll back
+# redaction. Needs policy.publicKeys; policy.tenant is recommended. With
+# policy.existingConfigMap as well, policy.json is only what a pod starts on
+# while the control plane cannot be reached. See "Control plane" in the README.
+control:
+  enabled: false
+  url: https://api.safestreamdata.com
+  # Key in existingSecret holding the connector token ("sst_agent_..."):
+  #   kubectl -n <namespace> patch secret safestream-secrets \
+  #     -p '{"stringData": {"control-token": "sst_agent_..."}}'
+  tokenKey: control-token
+  # Seconds between checks for a newer policy.
+  pollSeconds: 30
+  # Egress proxy for the uplink only, e.g. http://proxy.corp.example:3128.
+  httpsProxy: ""
+  # Egress the NetworkPolicy opens for the uplink. A NetworkPolicy cannot name
+  # a host, so the default is any address on 443; narrow it to your egress
+  # proxy, or to Cloudflare's published ranges.
+  egress:
+    - to:
+        - ipBlock: { cidr: 0.0.0.0/0 }
+      ports:
+        - { protocol: TCP, port: 443 }
+
+# Leak canaries: every intervalSeconds, synthetic records with freshly made-up
+# PII go through the live redactor (never to Kafka) and must come out clean.
+# A leak raises safestream_canary_leaks_total and halts a staged rollout.
+# onLeak: report (count, log, alert) or stop (also stop publishing: the pod
+# exits with code 4 and restarts into the same check). 0 turns canaries off.
+canary:
+  intervalSeconds: 300
+  onLeak: report
+
 # Compliance audit events: one content-free JSON event per window. Create the
 # topic first, with long retention, and grant this service Write on it.
 audit:

@@ -200,6 +200,10 @@ spec:
             - name: SAFESTREAM_HMAC_KEY
               valueFrom:
                 secretKeyRef: { name: safestream-secrets, key: hmac-key }
+            - name: SAFESTREAM_CANARY_INTERVAL_S
+              value: "300"
+            - name: SAFESTREAM_CANARY_ON_LEAK
+              value: "report"
             - name: SAFESTREAM_METRICS_PORT
               value: "9400"
             - name: LOG_LEVEL

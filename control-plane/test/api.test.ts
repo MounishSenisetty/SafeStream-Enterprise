@@ -29,6 +29,8 @@ async function tenant(prefix = "acme") {
 }
 
 const RULES = { mode: "extend", rules: { "*loyalty_number*": "id_number" }, disable: [] };
+/** Promote for everyone at once (the default is a staged rollout). */
+const IMMEDIATE = { strategy: "immediate" };
 
 const sha256 = async (text: string) =>
   "sha256:" + [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text)))].map((b) => b.toString(16).padStart(2, "0")).join("");
@@ -117,7 +119,7 @@ describe("policies", () => {
     expect((await call("GET", "/v1/agent/policy/candidate", t.agent)).status).toBe(200);
     expect((await call("GET", "/v1/agent/policy/active", t.agent)).status).toBe(404);
 
-    expect((await call("POST", "/v1/policies/1/promote", t.admin)).data).toEqual({ version: 1, state: "active" });
+    expect((await call("POST", "/v1/policies/1/promote", t.admin, IMMEDIATE)).data).toEqual({ version: 1, state: "active" });
     const active = await call("GET", "/v1/agent/policy/active", t.agent);
     expect(active.status).toBe(200);
     expect((await call("GET", "/v1/agent/policy/candidate", t.agent)).status).toBe(404);
@@ -145,11 +147,11 @@ describe("policies", () => {
     const sig = Uint8Array.from(atob(signature.signature), (c) => c.charCodeAt(0));
     expect(await crypto.subtle.verify("Ed25519", key, sig, payloadBytes)).toBe(true);
 
-    await call("POST", "/v1/policies/2/promote", t.admin);
+    await call("POST", "/v1/policies/2/promote", t.admin, IMMEDIATE);
     // Rollback and unknown versions are refused.
-    expect((await call("POST", "/v1/policies/1/promote", t.admin)).status).toBe(409);
-    expect((await call("POST", "/v1/policies/2/promote", t.admin)).status).toBe(409);
-    expect((await call("POST", "/v1/policies/9/promote", t.admin)).status).toBe(409);
+    expect((await call("POST", "/v1/policies/1/promote", t.admin, IMMEDIATE)).status).toBe(409);
+    expect((await call("POST", "/v1/policies/2/promote", t.admin, IMMEDIATE)).status).toBe(409);
+    expect((await call("POST", "/v1/policies/9/promote", t.admin, IMMEDIATE)).status).toBe(409);
     const list = await call("GET", "/v1/policies", t.admin);
     expect(list.data).toMatchObject({ active_version: 2, candidate_version: null });
     expect(list.data.policies.map((p: any) => p.version)).toEqual([2, 1]);
@@ -239,12 +241,175 @@ describe("telemetry", () => {
   });
 });
 
+/** A connector that reports audit windows under its own chain, as the Python one does. */
+function connector(t: Awaited<ReturnType<typeof tenant>>, instance: string) {
+  let seq = 0;
+  let prev: string | null = null;
+  return {
+    instance,
+    /** Its "active" bundle, as served to it now: the payload's version, or null. */
+    async served(): Promise<number | null> {
+      const r = await call("GET", "/v1/agent/policy/active", t.agent, undefined, { "x-safestream-instance": instance });
+      if (r.status === 404) return null;
+      const payload = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(r.data.payload), (c) => c.charCodeAt(0))));
+      return payload.version;
+    },
+    async report(version: number, extra: { egress?: number; dlq?: number; leaks?: number } = {}) {
+      const body = event(t.id, seq, prev, {
+        instance,
+        chain: { id: `${instance}-chain`, seq, prev },
+        policy: { tenant: t.id, version, key_id: t.keyId },
+        records: { egress: extra.egress ?? 500, dlq: extra.dlq ?? 0 },
+        canary: { checks: 2, leaks: extra.leaks ?? 0 },
+      });
+      const r = await call("POST", "/v1/agent/telemetry", t.agent, body);
+      expect(r.status).toBe(202);
+      seq += 1;
+      prev = await sha256(body);
+    },
+  };
+}
+
+/** A tenant on version 1 everywhere, with `n` connectors reporting, and version 2 published. */
+async function fleet(n: number) {
+  const t = await tenant("fleet");
+  await call("POST", "/v1/policies", t.admin, { field_rules: { rules: {} } });
+  await call("POST", "/v1/policies/1/promote", t.admin, IMMEDIATE);
+  const agents = Array.from({ length: n }, (_, i) => connector(t, `pod-${i}`));
+  for (const a of agents) await a.report(1, { egress: 1000, dlq: 2 });
+  await call("POST", "/v1/policies", t.admin, { field_rules: RULES });
+  return { t, agents };
+}
+
+const servedVersions = async (agents: ReturnType<typeof connector>[]) => Promise.all(agents.map((a) => a.served()));
+const rollout = async (t: { admin: string }) => (await call("GET", "/v1/rollout", t.admin)).data.rollout;
+
+describe("staged rollout", () => {
+  it("goes to one connector, then a tenth of the fleet, then all of it", async () => {
+    const { t, agents } = await fleet(12);
+    const promoted = await call("POST", "/v1/policies/2/promote", t.admin, { soak_seconds: 0 });
+    expect(promoted.data).toEqual({ version: 2, state: "rolling_out", stage: "first_agent", soak_seconds: 0 });
+
+    // Stage 1: exactly one connector is offered version 2; the rest keep 1.
+    let served = await servedVersions(agents);
+    expect(served.filter((v) => v === 2)).toHaveLength(1);
+    expect(served.filter((v) => v === 1)).toHaveLength(11);
+    expect(await rollout(t)).toMatchObject({ version: 2, stage: "first_agent", live_agents: 12, on_version: 0, halted: false });
+    // A connector that does not name itself is never part of a rollout.
+    expect((await call("GET", "/v1/agent/policy/active", t.agent)).data.payload).toBeDefined();
+
+    // It adopts the version and reports a healthy window: on to a tenth (2 of 12).
+    const first = agents[served.indexOf(2)]!;
+    await first.report(2);
+    expect(await rollout(t)).toMatchObject({ stage: "ten_percent", on_version: 1 });
+    served = await servedVersions(agents);
+    expect(served.filter((v) => v === 2)).toHaveLength(2);
+    expect(served[agents.indexOf(first)]).toBe(2); // the first one stays in
+
+    // Both report under version 2: the rollout completes and 2 is the active version.
+    for (const [i, v] of served.entries()) if (v === 2) await agents[i]!.report(2);
+    const list = await call("GET", "/v1/policies", t.admin);
+    expect(list.data).toMatchObject({ active_version: 2, candidate_version: null, rollout: null });
+    expect(new Set(await servedVersions(agents))).toEqual(new Set([2]));
+  });
+
+  it("waits for the soak time before moving on", async () => {
+    const { t, agents } = await fleet(3);
+    await call("POST", "/v1/policies/2/promote", t.admin, { soak_seconds: 3600 });
+    const served = await servedVersions(agents);
+    await agents[served.indexOf(2)]!.report(2);
+    expect(await rollout(t)).toMatchObject({ stage: "first_agent", on_version: 1 });
+  });
+
+  it("halts on a leak canary, stops spreading, and keeps the version where it already is", async () => {
+    const { t, agents } = await fleet(5);
+    await call("POST", "/v1/policies/2/promote", t.admin, { soak_seconds: 0 });
+    const first = agents[(await servedVersions(agents)).indexOf(2)]!;
+    await first.report(2, { leaks: 1 });
+
+    const state = await rollout(t);
+    expect(state).toMatchObject({ stage: "first_agent", halted: true });
+    expect(state.halted_reason).toContain(`leak canary failed on ${first.instance} under version 2`);
+    // Nobody else is offered version 2; the connector already on it is not pushed back
+    // (it would refuse version 1 anyway).
+    const served = await servedVersions(agents);
+    expect(served.filter((v) => v === 2)).toEqual([2]);
+    expect(served[agents.indexOf(first)]).toBe(2);
+    // More healthy windows do not unhalt it.
+    await first.report(2);
+    expect((await rollout(t)).halted).toBe(true);
+
+    // Resume starts the stage over; abort ends the rollout with version 1 still active.
+    expect((await call("POST", "/v1/rollout/resume", t.admin)).data.rollout).toMatchObject({ halted: false });
+    expect((await call("POST", "/v1/rollout/resume", t.admin)).status).toBe(409);
+    const aborted = await call("POST", "/v1/rollout/abort", t.admin);
+    expect(aborted.data).toEqual({ active_version: 1, rollout: null });
+    expect(await first.served()).toBe(2);
+    expect((await call("POST", "/v1/rollout/abort", t.admin)).status).toBe(409);
+  });
+
+  it("halts when the new version dead-letters clearly more than the fleet", async () => {
+    const { t, agents } = await fleet(4);
+    await call("POST", "/v1/policies/2/promote", t.admin, { soak_seconds: 0 });
+    const first = agents[(await servedVersions(agents)).indexOf(2)]!;
+    await first.report(2, { egress: 900, dlq: 100 });
+    const state = await rollout(t);
+    expect(state.halted).toBe(true);
+    expect(state.halted_reason).toMatch(/^DLQ rate 10\.0% on pod-\d under version 2, fleet 0\.2%$/);
+  });
+
+  it("a newer version replaces a halted rollout; versions only go up", async () => {
+    const { t, agents } = await fleet(2);
+    await call("POST", "/v1/policies/2/promote", t.admin, { soak_seconds: 0 });
+    const first = agents[(await servedVersions(agents)).indexOf(2)]!;
+    await first.report(2, { leaks: 3 });
+    await call("POST", "/v1/policies", t.admin, { field_rules: { rules: {} } });
+    expect((await call("POST", "/v1/policies/2/promote", t.admin)).status).toBe(409);
+    expect((await call("POST", "/v1/policies/1/promote", t.admin)).status).toBe(409);
+    expect((await call("POST", "/v1/policies/3/promote", t.admin, { soak_seconds: 0 })).status).toBe(200);
+    expect(await rollout(t)).toMatchObject({ version: 3, stage: "first_agent", halted: false });
+    // Immediate promotion of the rollout's version ends it.
+    expect((await call("POST", "/v1/policies/3/promote", t.admin, IMMEDIATE)).data).toEqual({ version: 3, state: "active" });
+    expect(await rollout(t)).toBeNull();
+    expect(new Set(await servedVersions(agents))).toEqual(new Set([3]));
+  });
+
+  it.each([[{ strategy: "yolo" }], [{ soak_seconds: -1 }], [{ soak_seconds: 1.5 }], [{ extra: 1 }], ["not json"]])(
+    "refuses a malformed promotion %#",
+    async (bad) => {
+      const { t } = await fleet(1);
+      expect((await call("POST", "/v1/policies/2/promote", t.admin, bad)).status).toBe(typeof bad === "string" ? 400 : 422);
+    },
+  );
+});
+
+describe("connector enrollment", () => {
+  it("tells a connector token which tenant it belongs to, and nothing to an admin token", async () => {
+    const t = await tenant();
+    expect((await call("GET", "/v1/agent/whoami", t.agent)).data).toMatchObject({ tenant: t.id, label: "prod cluster" });
+    expect((await call("GET", "/v1/agent/whoami", t.admin)).status).toBe(403);
+    expect((await call("GET", "/v1/agent/whoami")).status).toBe(401);
+  });
+
+  it("accepts leak-canary counts and refuses anything else in their place", async () => {
+    const t = await tenant();
+    const ok = event(t.id, 0, null, { canary: { checks: 4, leaks: 0 } });
+    expect((await call("POST", "/v1/agent/telemetry", t.agent, ok)).status).toBe(202);
+    const agents = (await call("GET", "/v1/agents", t.admin)).data.agents;
+    expect(agents[0]).toMatchObject({ canary_checks: 4, canary_leaks: 0, egress_records: 48210, dlq_records: 3 });
+    for (const canary of [{ checks: 1, leaks: 0, sample: "bob@corp.example" }, { checks: "1", leaks: 0 }, "leaked"]) {
+      const bad = event(t.id, 1, await sha256(ok), { canary });
+      expect((await call("POST", "/v1/agent/telemetry", t.agent, bad)).status).toBe(422);
+    }
+  });
+});
+
 describe("tenant isolation", () => {
   it("one tenant sees nothing of another's, on every route", async () => {
     const a = await tenant("alpha");
     const b = await tenant("bravo");
     await call("POST", "/v1/policies", a.admin, { field_rules: RULES });
-    await call("POST", "/v1/policies/1/promote", a.admin);
+    await call("POST", "/v1/policies/1/promote", a.admin, IMMEDIATE);
     await call("POST", "/v1/agent/telemetry", a.agent, event(a.id, 0, null));
 
     // B's admin: no policies, agents, chains or tokens of A's.
@@ -254,7 +419,7 @@ describe("tenant isolation", () => {
     const bTokens = (await call("GET", "/v1/tokens", b.admin)).data.tokens;
     expect(bTokens).toHaveLength(2);
     // B cannot promote A's version (B has no version 1), revoke A's tokens, or fetch A's policy.
-    expect((await call("POST", "/v1/policies/1/promote", b.admin)).status).toBe(409);
+    expect((await call("POST", "/v1/policies/1/promote", b.admin, IMMEDIATE)).status).toBe(409);
     const aAgent = (await call("GET", "/v1/tokens", a.admin)).data.tokens.find((x: any) => x.kind === "agent");
     expect((await call("POST", `/v1/tokens/${aAgent.id}/revoke`, b.admin)).status).toBe(404);
     expect((await call("GET", "/v1/agent/policy/active", b.agent)).status).toBe(404);
@@ -273,6 +438,17 @@ describe("compatibility with the connector", () => {
   // The same file is verified by the Python connector's own code in
   // tests/test_control_plane_bundle.py: if either side changes the bundle
   // format or the key id, one of the two tests fails.
+  // tests/test_control_contract.py keeps this file identical in shape to the
+  // audit event the connector builds; here the Worker must accept it as is.
+  it("accepts the audit event the connector builds", async () => {
+    const fixture = (await import("./fixtures/audit-event.json?raw")).default as string;
+    const created = await call("POST", "/v1/admin/tenants", "test-platform-admin-token", { id: "contract-acme", name: "Contract" });
+    const agent = await call("POST", "/v1/agent-tokens", created.data.admin_token, { label: "contract" });
+    const posted = await call("POST", "/v1/agent/telemetry", agent.data.token, fixture);
+    expect(posted.status).toBe(202);
+    expect(posted.data.head).toBe(await sha256(fixture));
+  });
+
   it("signs the committed fixture byte for byte", async () => {
     const { signBundle, wrap } = await import("../src/crypto");
     const fixture = (await import("./fixtures/policy-bundle.json?raw")).default as string;
@@ -295,7 +471,7 @@ describe("documentation", () => {
     const served = [...source.matchAll(/\["(GET|POST)", \/\^(.+?)\$\/,/g)].map((m) =>
       m[2]!.replaceAll("\\/", "/").replace(/\((?:\[0-9a-f\]\{12\})\)/, "{id}").replace(/\(\[1-9\].*?\)/, "{version}").replace("(active|candidate)", "{which}"),
     );
-    expect(served.length).toBe(12);
+    expect(served.length).toBe(16);
     for (const path of served) expect(spec, path).toContain(`  ${path}:`);
   });
 });
