@@ -1,0 +1,65 @@
+{
+  "schema": "safestream.audit/v2",
+  "connector_version": "0.3.0",
+  "instance": "safestream-kafka-redactor-7d9f8-x2k4q",
+  "group_id": "safestream-redactor",
+  "topics": {
+    "ingress": "ingress-logs",
+    "egress": "egress-logs-clean",
+    "dlq": "ingress-logs-dlq"
+  },
+  "delivery": "at_least_once",
+  "redaction_mode": "replace",
+  "field_rules": {
+    "count": 66,
+    "fingerprint": "sha256:abababababababababababababababababababababababababababababababab"
+  },
+  "policy": {
+    "tenant": "contract-acme",
+    "version": 1,
+    "key_id": "9a41c0de52b7f310"
+  },
+  "shadow": {
+    "candidate": {
+      "tenant": "contract-acme",
+      "version": 2,
+      "key_id": "9a41c0de52b7f310"
+    },
+    "since": "2026-11-11T09:00:00+00:00",
+    "records": 3,
+    "changed_records": 3,
+    "errors": 0,
+    "redactions": {
+      "active": {
+        "email": 3
+      },
+      "candidate": {
+        "email": 3,
+        "id_number": 3
+      }
+    }
+  },
+  "chain": {
+    "id": "safestream-kafka-redactor-7d9f8-x2k4q-20261111T090000000000Z",
+    "seq": 1,
+    "prev": "sha256:0a8fac05de89e5c6dcdb0a569db4c344f3bb47a9af967476ff2fd6067d5f89f5"
+  },
+  "window": {
+    "start": "2026-11-11T09:00:00.000+00:00",
+    "end": "2026-11-11T09:01:00.000+00:00",
+    "final": false
+  },
+  "records": {
+    "egress": 3,
+    "dlq": 0
+  },
+  "redactions": {
+    "email": 3
+  },
+  "batches": 1,
+  "transaction_aborts": 0,
+  "canary": {
+    "checks": 2,
+    "leaks": 0
+  }
+}

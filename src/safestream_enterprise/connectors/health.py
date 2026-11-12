@@ -73,6 +73,24 @@ class Histogram:
         return lines
 
 
+class CanaryCounts(NamedTuple):
+    """Leak canaries run so far (see :mod:`safestream_enterprise.canary`)."""
+
+    checks: int = 0
+    leaks: int = 0
+
+
+class ControlMetrics(NamedTuple):
+    """The control-plane uplink (see :mod:`safestream_enterprise.control`)."""
+
+    connected: bool
+    requests_failed: int
+    telemetry_sent: int
+    telemetry_rejected: int
+    telemetry_dropped: int
+    queue_depth: int
+
+
 class ConnectorMetrics(NamedTuple):
     """A point-in-time, content-free view of the connector."""
 
@@ -98,6 +116,10 @@ class ConnectorMetrics(NamedTuple):
     assigned_partitions: int = 0
     batch_seconds: Histogram | None = None
     record_seconds: Histogram | None = None
+    #: ``None`` when canaries are off.
+    canary: CanaryCounts | None = None
+    #: ``None`` when there is no control plane (air-gapped).
+    control: ControlMetrics | None = None
 
 
 def render_metrics(m: ConnectorMetrics, now: float) -> str:
@@ -175,6 +197,36 @@ def render_metrics(m: ConnectorMetrics, now: float) -> str:
             f'safestream_shadow_redactions_total{{policy="{which}",entity_type="{t}"}} {n}'
             for which in ("active", "candidate")
             for t, n in m.shadow["redactions"][which].items()
+        ]
+    if m.canary is not None:
+        lines += [
+            "# HELP safestream_canary_checks_total Synthetic PII records redacted to prove "
+            "the policy in force still redacts.",
+            "# TYPE safestream_canary_checks_total counter",
+            f"safestream_canary_checks_total {m.canary.checks}",
+            "# HELP safestream_canary_leaks_total Canary records whose fake PII survived "
+            "redaction. Anything above zero is an incident.",
+            "# TYPE safestream_canary_leaks_total counter",
+            f"safestream_canary_leaks_total {m.canary.leaks}",
+        ]
+    if m.control is not None:
+        c = m.control
+        lines += [
+            "# HELP safestream_control_connected 1 while the control plane answers.",
+            "# TYPE safestream_control_connected gauge",
+            f"safestream_control_connected {int(c.connected)}",
+            "# HELP safestream_control_requests_failed_total Control-plane requests that failed.",
+            "# TYPE safestream_control_requests_failed_total counter",
+            f"safestream_control_requests_failed_total {c.requests_failed}",
+            "# HELP safestream_control_telemetry_total Audit events sent to the control "
+            "plane, by outcome.",
+            "# TYPE safestream_control_telemetry_total counter",
+            f'safestream_control_telemetry_total{{outcome="accepted"}} {c.telemetry_sent}',
+            f'safestream_control_telemetry_total{{outcome="refused"}} {c.telemetry_rejected}',
+            f'safestream_control_telemetry_total{{outcome="dropped"}} {c.telemetry_dropped}',
+            "# HELP safestream_control_queue_depth Audit events waiting for the control plane.",
+            "# TYPE safestream_control_queue_depth gauge",
+            f"safestream_control_queue_depth {c.queue_depth}",
         ]
     if m.batch_seconds is not None:
         lines += m.batch_seconds.render(

@@ -86,7 +86,33 @@ spec:
               value: {{ .Values.redaction.unparseable | quote }}
             - name: SAFESTREAM_DELIVERY
               value: {{ .Values.redaction.delivery | quote }}
+            {{- if .Values.control.enabled }}
+            - name: SAFESTREAM_CONTROL_URL
+              value: {{ .Values.control.url | quote }}
+            - name: SAFESTREAM_CONTROL_TOKEN
+              valueFrom:
+                secretKeyRef: { name: {{ .Values.existingSecret }}, key: {{ .Values.control.tokenKey }} }
+            - name: SAFESTREAM_CONTROL_POLL_S
+              value: {{ .Values.control.pollSeconds | quote }}
+            {{- with .Values.control.httpsProxy }}
+            - name: HTTPS_PROXY
+              value: {{ . | quote }}
+            {{- end }}
+            - name: SAFESTREAM_POLICY_PUBLIC_KEYS
+              value: {{ required "policy.publicKeys is required with control.enabled" (join "," .Values.policy.publicKeys) | quote }}
+            {{- with .Values.policy.tenant }}
+            - name: SAFESTREAM_POLICY_TENANT
+              value: {{ . | quote }}
+            {{- end }}
             {{- if .Values.policy.existingConfigMap }}
+            - name: SAFESTREAM_POLICY_FILE
+              value: /etc/safestream/policy.json
+            {{- end }}
+            - name: SAFESTREAM_SHADOW_SAMPLE_EVERY
+              value: {{ .Values.policy.shadowSampleEvery | quote }}
+            - name: SAFESTREAM_POLICY_MIN_VERSION
+              value: {{ .Values.policy.minVersion | quote }}
+            {{- else if .Values.policy.existingConfigMap }}
             - name: SAFESTREAM_POLICY_FILE
               value: /etc/safestream/policy.json
             - name: SAFESTREAM_POLICY_PUBLIC_KEYS
@@ -105,9 +131,11 @@ spec:
             - name: SAFESTREAM_FIELD_RULES_FILE
               value: /etc/safestream/field-rules.json
             {{- end }}
-            {{- if .Values.audit.topic }}
+            {{- with .Values.audit.topic }}
             - name: SAFESTREAM_AUDIT_TOPIC
-              value: {{ .Values.audit.topic | quote }}
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if or .Values.audit.topic .Values.control.enabled }}
             - name: SAFESTREAM_AUDIT_INTERVAL_S
               value: {{ .Values.audit.intervalSeconds | quote }}
             {{- end }}
@@ -118,6 +146,10 @@ spec:
               valueFrom:
                 secretKeyRef: { name: {{ .Values.existingSecret }}, key: hmac-key }
             {{- end }}
+            - name: SAFESTREAM_CANARY_INTERVAL_S
+              value: {{ .Values.canary.intervalSeconds | quote }}
+            - name: SAFESTREAM_CANARY_ON_LEAK
+              value: {{ .Values.canary.onLeak | quote }}
             - name: SAFESTREAM_METRICS_PORT
               value: {{ .Values.metrics.port | quote }}
             - name: LOG_LEVEL

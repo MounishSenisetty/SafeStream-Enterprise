@@ -227,8 +227,15 @@ with open("app.ndjson") as src, open("app.clean.ndjson", "w") as dst:
 | `SAFESTREAM_POLICY_RELOAD_S` | `30` | How often the bundle file is checked for a newer version |
 | `SAFESTREAM_SHADOW_POLICY_FILE` | none | Candidate bundle to evaluate in shadow; the file may be absent. See [Shadow mode](#shadow-mode-try-a-policy-before-it-applies) |
 | `SAFESTREAM_SHADOW_SAMPLE_EVERY` | `1` | Shadow every Nth record. Each shadowed record is redacted a second time |
-| `SAFESTREAM_AUDIT_TOPIC` | none | Topic for compliance audit events; unset turns auditing off. See [Compliance audit events](#compliance-audit-events) |
+| `SAFESTREAM_AUDIT_TOPIC` | none | Topic for compliance audit events. Unset, events are built only for a control plane, if there is one. See [Compliance audit events](#compliance-audit-events) |
 | `SAFESTREAM_AUDIT_INTERVAL_S` | `60` | Seconds per audit window (minimum 1) |
+| `SAFESTREAM_CONTROL_URL` | none | Control plane, e.g. `https://api.safestreamdata.com`. Unset: the connector talks to nothing but its brokers. See [Control plane](#control-plane-optional) |
+| `SAFESTREAM_CONTROL_TOKEN` | none | Connector token (`sst_agent_…`) from the control plane; mount from a Secret |
+| `SAFESTREAM_CONTROL_POLL_S` | `30` | How often the control plane is asked for a newer policy |
+| `SAFESTREAM_CONTROL_STARTUP_TIMEOUT_S` | `60` | How long startup keeps trying the control plane before falling back to `SAFESTREAM_POLICY_FILE`, or exiting without one |
+| `SAFESTREAM_CONTROL_CA_FILE` | none | Extra CA bundle for a TLS-inspecting egress proxy (`HTTPS_PROXY` is honoured) |
+| `SAFESTREAM_CANARY_INTERVAL_S` | `300` | Seconds between [leak canaries](#leak-canaries); `0` turns them off |
+| `SAFESTREAM_CANARY_ON_LEAK` | `report` | `report`: count, log and alert. `stop`: also stop the connector (exit code 4) |
 | `SAFESTREAM_METRICS_PORT` | `9400` | Port for `/healthz`, `/readyz` and `/metrics`; `0` turns the endpoint off. See [Monitoring](#monitoring) |
 | `SAFESTREAM_LIVENESS_TIMEOUT_S` | `120` | Once the main loop hasn't advanced for this long, `/healthz` fails and the connector exits with code 3 to be restarted. Must be at least twice `SAFESTREAM_FLUSH_TIMEOUT_S` |
 | `SAFESTREAM_TRANSACTIONAL_ID` | `<group id>-<hostname>` | Exactly-once only. The default (the pod name on Kubernetes) is unique per instance, which is all exactly-once needs |
@@ -423,6 +430,85 @@ from the pipeline itself rather than from scraping logs or keeping metrics for y
   connector's account Write on it. Events are keyed by instance, so each pod's events stay in
   order.
 
+### Control plane (optional)
+
+The control plane at `api.safestreamdata.com` manages policies for a fleet of connectors
+(source and API in [`control-plane/`](control-plane/README.md)). It is optional: without
+`SAFESTREAM_CONTROL_URL` none of this runs and the connector reaches nothing but its brokers.
+With it, each connector:
+
+- **pulls** its signed policy, and the candidate to evaluate in shadow, every
+  `SAFESTREAM_CONTROL_POLL_S`. It verifies each bundle itself with
+  `SAFESTREAM_POLICY_PUBLIC_KEYS`, exactly as it verifies a file, so the control plane cannot
+  forge, weaken or roll back a policy: it can only distribute ones signed with the tenant's key.
+- **pushes** its audit events, byte for byte, so the control plane anchors each hash chain's
+  head outside your own audit store (what `safestream-audit verify --head` checks). An event
+  per audit window also serves as the connector's heartbeat. An audit topic is optional with a
+  control plane; with one, the topic stays the record and the control plane gets a copy.
+
+What it never does:
+
+- **Send record content.** The only upload is the audit event above: counts, entity-type
+  names, versions and hashes. Before an event is queued it is checked against an allow-list of
+  exactly those (`control.check_content_free`); the control plane enforces the same list and
+  refuses anything else. Tests on both sides hold the line, and a shared fixture keeps the two
+  in step.
+- **Accept connections.** Every request is outbound HTTPS from the connector. Redirects are
+  never followed, and plain HTTP is refused except to `localhost`.
+- **Stop redaction.** The uplink runs on its own thread. If the control plane is down, the
+  connector keeps redacting under the last policy it verified, and audit events wait in a
+  bounded queue (1,000 events, about 16 hours at one a minute; beyond that the oldest are
+  dropped and the control plane marks that chain as broken).
+
+Enrolling a connector deployment: a tenant admin issues a token, which comes back with the
+tenant's public key, and the connector gets both:
+
+```bash
+curl -sS https://api.safestreamdata.com/v1/agent-tokens \
+  -H "authorization: Bearer $ADMIN_TOKEN" -d '{"label": "prod-eu-1"}'
+```
+
+```bash
+safestream-control check
+```
+
+`safestream-control check` reads the same `SAFESTREAM_CONTROL_*` and
+`SAFESTREAM_POLICY_PUBLIC_KEYS` variables as the connector. It checks the token, reaches the
+control plane and verifies the active and candidate bundles with the configured keys. With the
+Helm chart, set `control.enabled=true`, `policy.publicKeys` and `policy.tenant`, and add the
+token to the Secret as `control-token`. The NetworkPolicy then also allows HTTPS out
+(`control.egress`; narrow it to your egress proxy).
+
+At startup the connector needs a verified policy before it consumes anything. If the control
+plane cannot be reached within `SAFESTREAM_CONTROL_STARTUP_TIMEOUT_S`, it starts on
+`SAFESTREAM_POLICY_FILE` if one is mounted. Otherwise it exits (code 1) and is restarted:
+it never consumes without a policy.
+
+**Staged rollout.** Promoting a policy on the control plane rolls it out in stages: to one
+connector, then to a tenth of the fleet, then to all of it. A stage ends when every connector
+in it has reported an audit window under the new version and the soak time (default 10
+minutes) has passed. The rollout **halts** by itself as soon as a connector on the new version
+reports a leak canary, or a DLQ rate more than one point above the rest of the fleet's. A halt
+stops the version spreading. It cannot take the version back from connectors that already run
+it, because a connector never accepts an older policy. The fix for a bad version is a newer
+one, rolled out the same way. `{"strategy": "immediate"}` promotes to everyone at once.
+
+### Leak canaries
+
+A signed policy proves which rules are in force, not that they work. Every
+`SAFESTREAM_CANARY_INTERVAL_S` (default 5 minutes) the connector builds two synthetic records,
+one JSON and one XML. They carry freshly generated fake PII (an `example.com` address, a
+Luhn-valid test card number, a social security number), both under field names the built-in
+rules cover and inside free text. The connector redacts them with the live redactor, on the
+same code path as a real record, and checks that no seeded value survives. The values are new
+each time, so no rule can special-case them, and canary records are never published.
+
+A leak raises `safestream_canary_leaks_total` (alert `SafeStreamCanaryLeak`), is logged as
+`LEAK CANARY` without the values, appears in the window's audit event as
+`"canary": {"checks": 2, "leaks": 1}`, and halts a staged rollout.
+`SAFESTREAM_CANARY_ON_LEAK=stop` also stops the connector, so nothing more is published under
+a policy that let PII through.
+
 ### Replaying the dead-letter topic
 
 Dead-lettered records are the original, unredacted records. Once the cause is fixed (a
@@ -476,12 +562,19 @@ Kubernetes manifest wires them up as probes and for Prometheus scraping.
 | `safestream_shadow_records_total` | counter | Records also redacted under the candidate |
 | `safestream_shadow_changed_records_total` | counter | Records whose output would differ under the candidate |
 | `safestream_shadow_redactions_total{policy="active"\|"candidate",entity_type="..."}` | counter | Redactions on shadowed records under each policy |
+| `safestream_canary_checks_total` | counter | Leak-canary records redacted (absent when canaries are off) |
+| `safestream_canary_leaks_total` | counter | Canary records whose fake PII survived redaction. Anything above zero is an incident |
+| `safestream_control_connected` | gauge | 1 while the control plane answers (only with a control plane) |
+| `safestream_control_requests_failed_total` | counter | Control-plane requests that failed |
+| `safestream_control_telemetry_total{outcome="accepted"\|"refused"\|"dropped"}` | counter | Audit events sent to the control plane: accepted, refused for good, or dropped from a full queue |
+| `safestream_control_queue_depth` | gauge | Audit events waiting for the control plane |
 | `safestream_heartbeat_age_seconds` | gauge | Seconds since the main loop last advanced |
 | `safestream_ready` | gauge | 1 while consuming |
 
 Ready-made alerts for these metrics are in `deploy/kubernetes/prometheus-rules.yaml`: no
 replica consuming, a stalled main loop, a sustained `dlq` rate (producers sending malformed
-records), repeated transaction aborts, and undelivered audit events. The connector reports
+records), repeated transaction aborts, undelivered audit events, a leak canary, and an
+unreachable control plane. The connector reports
 lag on the partitions it is consuming; lag on partitions nobody is consuming (every pod down) comes from your usual Kafka exporter,
 for example kafka-exporter or Burrow, under group `KAFKA_GROUP_ID`.
 
@@ -497,8 +590,9 @@ requests. The NetworkPolicy lets only the `monitoring` namespace reach the port.
 - **No silent stalls.** A Kafka client call can block far past its own timeout after a broker
   crash. A watchdog exits the process (code 3) when the main loop has not advanced for
   `SAFESTREAM_LIVENESS_TIMEOUT_S`, so it is restarted and resumes from the last committed
-  offset, with or without Kubernetes probing it. Exit codes: 0 clean stop, 1 Kafka error,
-  2 invalid configuration, 3 stalled.
+  offset, with or without Kubernetes probing it. Exit codes: 0 clean stop, 1 Kafka error (or
+  the control plane unreachable with no policy file to start on), 2 invalid configuration,
+  3 stalled, 4 stopped by a leak canary.
 - **No poison pills.** A record the clean topic itself rejects for good (too large once
   redacted, or a timestamp the topic refuses) would fail again on every replay. Its original
   goes to the DLQ instead, tagged with the broker's error name (for example
@@ -513,8 +607,14 @@ requests. The NetworkPolicy lets only the `monitoring` namespace reach the port.
   payloads. The DLQ records only the exception class, never its message.
 - **Hardened runtime.** The image is distroless: no shell, no package manager. The container
   runs as non-root on a read-only root filesystem with all Linux capabilities dropped. A
-  default-deny NetworkPolicy allows egress only to the Kafka brokers (port 9092) and DNS, and
-  ingress only from the `monitoring` namespace to the metrics port.
+  default-deny NetworkPolicy allows egress only to the Kafka brokers (port 9092) and DNS (plus
+  HTTPS out, only when the control plane is enabled), and ingress only from the `monitoring`
+  namespace to the metrics port.
+- **A control plane that cannot see data or weaken policy.** The optional uplink sends
+  allow-listed counts and hashes only, never accepts connections, and every bundle it delivers
+  is verified by the connector against keys configured in the cluster.
+- **Continuous proof.** Leak canaries push synthetic PII through the live redactor every few
+  minutes, so a policy that stops redacting is caught in minutes, not at the next audit.
 - **Rules that cannot be quietly weakened.** With a signed policy bundle, a change to the
   field rules takes effect only if it carries a trusted signature and a newer version.
 - **No plugin code by default.** Third-party detector plugins are disabled in the service.
@@ -544,6 +644,8 @@ SafeStream-Enterprise/
 │   ├── dlq.py                          # safestream-dlq: summarise and replay the DLQ
 │   ├── policy.py                       # safestream-policy: signed policy bundles
 │   ├── audit.py                        # safestream-audit: verify the audit hash chain
+│   ├── control.py                      # safestream-control: the optional control-plane uplink
+│   ├── canary.py                       # leak canaries: synthetic PII through the live redactor
 │   ├── logs.py                         # LOG_LEVEL / LOG_FORMAT for both entry points
 │   ├── rules.py                        # custom field rules + the shared redactor factory
 │   ├── parsers/

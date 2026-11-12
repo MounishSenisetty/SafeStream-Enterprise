@@ -27,7 +27,8 @@ metadata:
 # Source: safestream-enterprise/templates/networkpolicy.yaml
 # Default-deny for the connector pods. Selecting a pod with both policy types
 # denies all ingress and all egress not explicitly allowed below, so the only
-# reachable destinations are the Kafka brokers and cluster DNS.
+# reachable destinations are the Kafka brokers and cluster DNS (and, only with
+# control.enabled, HTTPS to the control plane).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -200,6 +201,10 @@ spec:
             - name: SAFESTREAM_HMAC_KEY
               valueFrom:
                 secretKeyRef: { name: safestream-secrets, key: hmac-key }
+            - name: SAFESTREAM_CANARY_INTERVAL_S
+              value: "300"
+            - name: SAFESTREAM_CANARY_ON_LEAK
+              value: "report"
             - name: SAFESTREAM_METRICS_PORT
               value: "9400"
             - name: LOG_LEVEL

@@ -48,7 +48,7 @@ components:
     AuditEvent:
       description: >-
         A safestream.audit/v2 event, byte for byte as the connector published it.
-        Unknown fields are refused.
+        Unknown fields are refused. canary ({checks, leaks}, optional) feeds rollout halts.
       type: object
   responses:
     Error:
@@ -123,10 +123,44 @@ paths:
         default: { $ref: "#/components/responses/Error" }
   /v1/policies/{version}/promote:
     post:
-      summary: Make a version the active policy (must be newer than the active one)
+      summary: Roll a version out (must be newer than the active one)
+      description: >-
+        staged (the default): to one connector, then a tenth of the fleet, then all of it.
+        A stage ends when every connector in it has reported a window under the version
+        and soak_seconds have passed; a leak canary or a DLQ rate above the fleet's halts
+        it. immediate: every connector at once. Connectors never accept an older version,
+        so neither strategy can be undone, only superseded.
       security: [{ tenantAdmin: [] }]
       parameters: [{ name: version, in: path, required: true, schema: { type: integer, minimum: 1 } }]
-      responses: { "200": { description: promoted }, default: { $ref: "#/components/responses/Error" } }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                strategy: { enum: [staged, immediate], default: staged }
+                soak_seconds: { type: integer, minimum: 0, maximum: 604800, default: 600 }
+      responses:
+        "200": { description: "state is rolling_out (with its first stage) or active" }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/rollout:
+    get:
+      summary: Where the rollout of a promoted version stands
+      description: Stage, the connectors in it, how many run the version, and why it halted.
+      security: [{ tenantAdmin: [] }]
+      responses: { "200": { description: rollout or null }, default: { $ref: "#/components/responses/Error" } }
+  /v1/rollout/abort:
+    post:
+      summary: Stop a rollout; connectors that already run its version keep it
+      security: [{ tenantAdmin: [] }]
+      responses: { "200": { description: aborted }, default: { $ref: "#/components/responses/Error" } }
+  /v1/rollout/resume:
+    post:
+      summary: Resume a halted rollout; its current stage starts over
+      security: [{ tenantAdmin: [] }]
+      responses: { "200": { description: resumed }, default: { $ref: "#/components/responses/Error" } }
   /v1/policies/candidate/withdraw:
     post:
       summary: Stop offering the candidate
@@ -143,11 +177,21 @@ paths:
       description: The values to pass to "safestream-audit verify --head".
       security: [{ tenantAdmin: [] }]
       responses: { "200": { description: chains }, default: { $ref: "#/components/responses/Error" } }
+  /v1/agent/whoami:
+    get:
+      summary: The tenant and label of the calling connector token
+      security: [{ agent: [] }]
+      responses: { "200": { description: "tenant, id, label" }, default: { $ref: "#/components/responses/Error" } }
   /v1/agent/policy/{which}:
     get:
       summary: The active or candidate policy bundle
+      description: >-
+        During a staged rollout the active bundle depends on the connector: name it in
+        x-safestream-instance (the instance of its audit events).
       security: [{ agent: [] }]
-      parameters: [{ name: which, in: path, required: true, schema: { enum: [active, candidate] } }]
+      parameters:
+        - { name: which, in: path, required: true, schema: { enum: [active, candidate] } }
+        - { name: x-safestream-instance, in: header, required: false, schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$" } }
       responses:
         "200": { description: bundle, content: { application/json: { schema: { $ref: "#/components/schemas/PolicyBundle" } } } }
         "304": { description: Unchanged since the ETag given in If-None-Match }

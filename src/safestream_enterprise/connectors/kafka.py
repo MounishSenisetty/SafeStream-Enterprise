@@ -85,17 +85,19 @@ from confluent_kafka import (
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from safestream_redactor import RedactionMode, RedactionStats
 
-from safestream_enterprise import __version__, audit, policy
+from safestream_enterprise import __version__, audit, control, policy
+from safestream_enterprise.canary import Canary
 from safestream_enterprise.connectors.health import (
     BATCH_BUCKETS,
     RECORD_BUCKETS,
+    CanaryCounts,
     ConnectorMetrics,
     HealthServer,
     Histogram,
 )
 from safestream_enterprise.logs import configure_logging
 from safestream_enterprise.parsers.json_ast import StructuredRedactor
-from safestream_enterprise.policy import Policy, PolicySource, parse_public_keys
+from safestream_enterprise.policy import BundleReader, Policy, PolicySource, parse_public_keys
 from safestream_enterprise.rules import make_redactor
 
 logger = logging.getLogger("safestream_enterprise.kafka")
@@ -202,6 +204,23 @@ class ConnectorConfig(BaseModel):
     audit_topic: str | None = Field(default=None, min_length=1)
     #: Seconds per audit window.
     audit_interval_s: float = Field(default=60.0, ge=1)
+    #: Control plane (see :mod:`safestream_enterprise.control`): base URL and
+    #: agent token. Both or neither; neither means fully air-gapped.
+    control_url: str | None = Field(default=None, min_length=1)
+    control_token: SecretStr | None = None
+    #: How often the control plane is asked for a newer policy.
+    control_poll_s: float = Field(default=30.0, ge=1)
+    #: Extra CA bundle for a TLS-inspecting egress proxy.
+    control_ca_file: Path | None = None
+    #: At startup, how long to keep trying the control plane before falling
+    #: back to ``policy_file`` (or, without one, giving up).
+    control_startup_timeout_s: float = Field(default=60.0, ge=0)
+    #: Seconds between leak canaries (synthetic PII through the live redactor);
+    #: 0 turns them off.
+    canary_interval_s: float = Field(default=300.0, ge=0)
+    #: ``report``: count and log a leak. ``stop``: also stop the connector, so
+    #: nothing more is published under a policy that let PII through.
+    canary_on_leak: Literal["report", "stop"] = "report"
     #: Extra librdkafka properties applied to both consumer and producer
     #: (security.protocol, sasl.*, ssl.* ...). Secret-wrapped: may hold passwords.
     client_overrides: dict[str, SecretStr] = Field(default_factory=dict)
@@ -229,7 +248,27 @@ class ConnectorConfig(BaseModel):
                 "set SAFESTREAM_POLICY_FILE or SAFESTREAM_FIELD_RULES_FILE, not both: "
                 "an unsigned rules file beside a signed policy would defeat the signature"
             )
-        if bool(self.policy_file) != bool(self.policy_public_keys):
+        if bool(self.control_url) != bool(self.control_token):
+            raise ValueError(
+                "SAFESTREAM_CONTROL_URL and SAFESTREAM_CONTROL_TOKEN must be set together"
+            )
+        if self.control_url:
+            control.validate_url(self.control_url)
+            if not self.policy_public_keys:
+                raise ValueError(
+                    "SAFESTREAM_CONTROL_URL requires SAFESTREAM_POLICY_PUBLIC_KEYS: the "
+                    "connector verifies every bundle the control plane sends"
+                )
+            if self.field_rules_file:
+                raise ValueError(
+                    "set SAFESTREAM_CONTROL_URL or SAFESTREAM_FIELD_RULES_FILE, not both"
+                )
+            if self.shadow_policy_file:
+                raise ValueError(
+                    "SAFESTREAM_SHADOW_POLICY_FILE cannot be used with SAFESTREAM_CONTROL_URL: "
+                    "the candidate comes from the control plane"
+                )
+        elif bool(self.policy_file) != bool(self.policy_public_keys):
             raise ValueError(
                 "SAFESTREAM_POLICY_FILE and SAFESTREAM_POLICY_PUBLIC_KEYS must be set together"
             )
@@ -250,6 +289,11 @@ class ConnectorConfig(BaseModel):
     @property
     def exactly_once(self) -> bool:
         return self.delivery == "exactly_once"
+
+    @property
+    def auditing(self) -> bool:
+        """Audit events are built: for an audit topic, the control plane, or both."""
+        return bool(self.audit_topic or self.control_url)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> ConnectorConfig:
@@ -284,6 +328,13 @@ class ConnectorConfig(BaseModel):
             "SAFESTREAM_SHADOW_SAMPLE_EVERY": "shadow_sample_every",
             "SAFESTREAM_AUDIT_TOPIC": "audit_topic",
             "SAFESTREAM_AUDIT_INTERVAL_S": "audit_interval_s",
+            "SAFESTREAM_CONTROL_URL": "control_url",
+            "SAFESTREAM_CONTROL_TOKEN": "control_token",
+            "SAFESTREAM_CONTROL_POLL_S": "control_poll_s",
+            "SAFESTREAM_CONTROL_CA_FILE": "control_ca_file",
+            "SAFESTREAM_CONTROL_STARTUP_TIMEOUT_S": "control_startup_timeout_s",
+            "SAFESTREAM_CANARY_INTERVAL_S": "canary_interval_s",
+            "SAFESTREAM_CANARY_ON_LEAK": "canary_on_leak",
         }
         data: dict[str, object] = {field: env[var] for var, field in names.items() if env.get(var)}
         data["client_overrides"] = {
@@ -382,25 +433,41 @@ class KafkaRedactionConnector:
         producer: Producer,
         policy_source: PolicySource | None = None,
         policy: Policy | None = None,
+        control_client: control.ControlClient | None = None,
     ) -> None:
         self.config = config
         self.redactor = redactor
+        #: Uplink to the control plane; ``None`` when air-gapped.
+        self.control = control_client
         #: Signed policy in force, and where newer ones come from (both or neither).
         self.policy = policy
         self._policy_source = policy_source
         self._policy_due = 0.0  # look for a candidate on the first loop iteration
+        # Bundles downloaded from the control plane are checked as soon as they change.
+        self._control_generation = -1
         self.policy_rejections = 0
         self.shadow: Shadow | None = None
+        candidates: Path | BundleReader | None = (
+            control_client.candidate_bundle if control_client else config.shadow_policy_file
+        )
         self._shadow_source = (
             PolicySource(
-                config.shadow_policy_file,
+                candidates,
                 policy_source.trusted,
                 policy_source.tenant,
                 policy_source.min_version,
+                missing_ok=True,
             )
-            if policy_source and config.shadow_policy_file
+            if policy_source and candidates
             else None
         )
+        # Leak canaries: synthetic PII through the live redactor (see .canary).
+        self._canary = Canary(strict=config.unparseable == "dlq")
+        self.canary_checks = 0
+        self.canary_leaks = 0
+        #: Set when a canary leak stopped the connector (main exits non-zero).
+        self.canary_stopped = False
+        self._canary_due = time.monotonic()  # first one on the first loop iteration
         self._shadow_tick = 0
         # Audit hash chain: one per run of this process (see safestream_enterprise.audit).
         self._chain_seq = 0
@@ -461,6 +528,12 @@ class KafkaRedactionConnector:
             assigned_partitions=self.assigned_partitions,
             batch_seconds=self.batch_seconds.copy(),
             record_seconds=self.record_seconds.copy(),
+            canary=(
+                CanaryCounts(self.canary_checks, self.canary_leaks)
+                if self.config.canary_interval_s
+                else None
+            ),
+            control=self.control.status() if self.control else None,
         )
 
     def _update_lag(self) -> None:
@@ -516,6 +589,7 @@ class KafkaRedactionConnector:
                     self.process_batch(batch)
                 self._update_lag()
                 self._maybe_reload_policy()
+                self._maybe_canary()
                 self._maybe_audit()
         finally:
             self.ready = False
@@ -542,8 +616,13 @@ class KafkaRedactionConnector:
         changes nothing: the policy in force stays in force, the refusal is
         logged and counted, and the file is checked again next time.
         """
-        if self._policy_source is None or time.monotonic() < self._policy_due:
+        if self._policy_source is None:
             return
+        fresh = self.control is not None and self.control.generation != self._control_generation
+        if not fresh and time.monotonic() < self._policy_due:
+            return
+        if self.control is not None:
+            self._control_generation = self.control.generation
         self._policy_due = time.monotonic() + self.config.policy_reload_s
         self._reload_active_policy()
         self._reload_shadow()
@@ -587,25 +666,22 @@ class KafkaRedactionConnector:
             return
         candidate: Policy | None = None
         redactor: StructuredRedactor | None = None
-        if source.path.exists():
-            try:
+        try:
+            data = source.read()
+            if data is not None:
                 # No "must be newer than the last candidate": candidates are
                 # replaced freely. Signature, tenant and floor still apply.
-                candidate = policy.verify(
-                    source.path.read_bytes(), source.trusted, source.tenant, source.min_version
-                )
+                candidate = policy.verify(data, source.trusted, source.tenant, source.min_version)
                 if candidate.version <= self.policy.version:
                     candidate = None  # promoted (or stale): nothing left to compare
                 elif self.shadow and candidate.digest == self.shadow.policy.digest:
                     return  # already evaluating this one
                 else:
                     redactor = build_redactor(self.config, candidate)
-            except OSError:
-                candidate = None  # removed between the check and the read
-            except ValueError as exc:
-                self.policy_rejections += 1
-                logger.error("candidate policy bundle refused, not evaluating it: %s", exc)
-                return
+        except ValueError as exc:  # PolicyError, including an unreadable file
+            self.policy_rejections += 1
+            logger.error("candidate policy bundle refused, not evaluating it: %s", exc)
+            return
         if candidate is None and self.shadow is None:
             return
         self._close_audit_window()  # one candidate per audit window
@@ -639,6 +715,38 @@ class KafkaRedactionConnector:
         shadow.changed += would_publish != published
         shadow.active.update(found.counts)
         shadow.candidate.update(theirs.counts)
+
+    # ------------------------------------------------------------------
+    # leak canaries
+    # ------------------------------------------------------------------
+
+    def _maybe_canary(self) -> None:
+        """Run a leak canary against the redactor in force, if one is due.
+
+        Runs between batches, on the redactor real records are redacted with.
+        A leak is logged (which formats leaked, never the values: they are
+        fake, but the log line must not teach anyone what to grep for) and counted;
+        with ``canary_on_leak=stop`` the connector also stops, after the batch
+        in hand, so nothing more is published under that policy.
+        """
+        interval = self.config.canary_interval_s
+        if not interval or time.monotonic() < self._canary_due:
+            return
+        self._canary_due = time.monotonic() + interval
+        result = self._canary.check(self.redactor)
+        self.canary_checks += result.checks
+        if not result.leaked:
+            return
+        self.canary_leaks += len(result.leaked)
+        logger.critical(
+            "LEAK CANARY: synthetic PII survived redaction (%s) under policy %s",
+            ", ".join(result.leaked),
+            self.policy.version if self.policy else "unsigned rules",
+        )
+        if self.config.canary_on_leak == "stop":
+            logger.critical("stopping: SAFESTREAM_CANARY_ON_LEAK=stop")
+            self._running = False
+            self.canary_stopped = True
 
     # ------------------------------------------------------------------
     # compliance audit events
@@ -702,6 +810,14 @@ class KafkaRedactionConnector:
             "redactions": redactions,
             "batches": current.batches - base.batches,
             "transaction_aborts": current.transaction_aborts - base.transaction_aborts,
+            "canary": (
+                {
+                    "checks": current.canary.checks - (base.canary.checks if base.canary else 0),
+                    "leaks": current.canary.leaks - (base.canary.leaks if base.canary else 0),
+                }
+                if current.canary is not None
+                else None
+            ),
         }
 
     def _maybe_audit(self, final: bool = False) -> None:
@@ -711,17 +827,23 @@ class KafkaRedactionConnector:
         batch's transaction. Every window is reported, including empty ones:
         "nothing processed" is evidence too.
         """
-        if not self.config.audit_topic:
+        if not self.config.auditing:
             return
         now = time.monotonic()
         if not final and now < self._audit_due:
             return
         self._audit_due = now + self.config.audit_interval_s
-        current = self._committed
+        # Canaries run between batches, not inside one: report them as of now.
+        current = self._committed._replace(canary=self.snapshot().canary)
         end = datetime.now(timezone.utc)
         event = self.audit_event(self._audit_base, current, self._audit_window_start, end, final)
         data = orjson.dumps(event)
-        if self._publish_audit(data):
+        # With an audit topic, the topic is the record and the control plane a
+        # copy; without one, handing the event to the uplink's queue is the
+        # publication (it is retried there until delivered).
+        if not self.config.audit_topic or self._publish_audit(data):
+            if self.control is not None:
+                self._uplink(event, data)
             self._audit_base, self._audit_window_start = current, end
             self.audit_events += 1
             # The chain advances only on an acknowledged event: a failed one is
@@ -730,6 +852,20 @@ class KafkaRedactionConnector:
             self._chain_prev = audit.event_hash(data)
         else:
             self.audit_failures += 1
+
+    def _uplink(self, event: dict[str, object], data: bytes) -> None:
+        """Queue an audit event for the control plane, if it is content-free.
+
+        The check is redundant with how events are built, on purpose: should a
+        future change put free text into an event, it stays local.
+        """
+        assert self.control is not None
+        try:
+            control.check_content_free(event)
+        except ValueError as exc:
+            logger.error("audit event not sent to the control plane: %s", exc)
+            return
+        self.control.enqueue(data)
 
     def _publish_audit(self, data: bytes) -> bool:
         """Deliver one audit event; ``False`` (logged) if it was not acknowledged.
@@ -1059,29 +1195,106 @@ def _next_offsets(messages: list[Message]) -> list[TopicPartition]:
     return [TopicPartition(topic, part, off + 1) for (topic, part), off in last.items()]
 
 
-def load_policy(config: ConnectorConfig) -> tuple[PolicySource, Policy] | tuple[None, None]:
+def connect_control(
+    config: ConnectorConfig,
+    transport: control.Transport | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[control.ControlClient, str | None]:
+    """A control-plane client that has authenticated and downloaded its policies.
+
+    Returns the client and the tenant its token belongs to, or ``None`` for
+    the tenant if the control plane could not be reached within
+    ``control_startup_timeout_s`` and ``policy_file`` is there to start from.
+    Raises :class:`ControlError` when it cannot be reached and there is no such
+    file, and ``ValueError`` when the token is for another tenant.
+    """
+    assert config.control_url and config.control_token
+    ca_file = str(config.control_ca_file) if config.control_ca_file else None
+    client = control.ControlClient(
+        config.control_url,
+        config.control_token.get_secret_value(),
+        socket.gethostname(),  # the audit events' "instance"
+        transport or control.urllib_transport(ca_file),
+        poll_s=config.control_poll_s,
+    )
+    deadline = time.monotonic() + config.control_startup_timeout_s
+    delay = 1.0
+    while True:
+        try:
+            tenant = str(client.whoami()["tenant"])
+            if config.policy_tenant and tenant != config.policy_tenant:
+                raise ValueError(
+                    f"the control-plane token is for tenant {tenant}, "
+                    f"not SAFESTREAM_POLICY_TENANT={config.policy_tenant}"
+                )
+            client.refresh()
+            logger.info("control plane %s reached (tenant=%s)", client.url, tenant)
+            return client, tenant
+        except control.ControlError as exc:
+            if time.monotonic() + delay > deadline:
+                if config.policy_file:
+                    logger.warning(
+                        "control plane unreachable (%s); starting on %s and retrying",
+                        exc,
+                        config.policy_file,
+                    )
+                    return client, None
+                raise
+            logger.warning("control plane not reachable yet (%s); retrying", exc)
+            sleep(delay)
+            delay = min(delay * 2, 10.0)
+
+
+def load_policy(
+    config: ConnectorConfig,
+    control_client: control.ControlClient | None = None,
+    tenant: str | None = None,
+) -> tuple[PolicySource, Policy] | tuple[None, None]:
     """The signed policy ``config`` names, verified; ``(None, None)`` if it names none.
+
+    With a control plane, later bundles come from ``control_client`` (whose
+    token belongs to ``tenant``) and ``policy_file``, if set, is only what the
+    connector starts on when the control plane has nothing for it yet.
 
     Raises ``ValueError`` (``PolicyError``) if the bundle is refused: a connector
     told to run a signed policy never starts on anything else.
     """
-    if not config.policy_file or not config.policy_public_keys:
+    if not config.policy_public_keys or not (config.policy_file or control_client):
         return None, None
-    source = PolicySource(
-        config.policy_file,
-        parse_public_keys(config.policy_public_keys),
-        config.policy_tenant,
-        config.policy_min_version,
+    trusted = parse_public_keys(config.policy_public_keys)
+    tenant = config.policy_tenant or tenant
+    file_source = (
+        PolicySource(config.policy_file, trusted, tenant, config.policy_min_version)
+        if config.policy_file
+        else None
     )
-    policy = source.load()
-    assert policy is not None  # only None when given a current policy
+    source: PolicySource
+    if control_client is None:
+        assert file_source is not None
+        source = file_source
+        verified = source.load()
+    else:
+        source = PolicySource(
+            control_client.active_bundle, trusted, tenant, config.policy_min_version
+        )
+        if control_client.active_bundle() is not None:
+            verified = source.load()
+        elif file_source is not None:
+            verified = file_source.load()
+            logger.warning("no policy from the control plane yet; starting on %s", file_source.path)
+        else:
+            raise policy.PolicyError(
+                "the control plane has no active policy for this tenant, and there is no "
+                "SAFESTREAM_POLICY_FILE to start on: promote one first"
+            )
+    assert verified is not None  # only None when given a current policy
     logger.info(
         "policy version %d verified (tenant=%s, key=%s)",
-        policy.version,
-        policy.tenant,
-        policy.key_id,
+        verified.version,
+        verified.tenant,
+        verified.key_id,
     )
-    return source, policy
+    return source, verified
 
 
 def build_redactor(config: ConnectorConfig, policy: Policy | None = None) -> StructuredRedactor:
@@ -1108,6 +1321,8 @@ def build_redactor(config: ConnectorConfig, policy: Policy | None = None) -> Str
 
 #: Exit code when the watchdog ends a stalled process.
 EXIT_STALLED = 3
+#: Exit code when a leak canary stopped the connector (SAFESTREAM_CANARY_ON_LEAK=stop).
+EXIT_CANARY_LEAK = 4
 
 
 def watchdog(
@@ -1140,18 +1355,26 @@ def watchdog(
 
 
 def main() -> int:
-    """Console entry point (``safestream-kafka``): 0 clean stop, 1 Kafka error, 2 bad
-    configuration, 3 stalled (see :func:`watchdog`)."""
+    """Console entry point (``safestream-kafka``): 0 clean stop, 1 Kafka error (or the
+    control plane unreachable with nothing to start on), 2 bad configuration,
+    3 stalled (see :func:`watchdog`), 4 stopped by a leak canary."""
     configure_logging()
+    control_client: control.ControlClient | None = None
     try:
         config = ConnectorConfig.from_env()
-        policy_source, policy = load_policy(config)
+        tenant: str | None = None
+        if config.control_url:
+            control_client, tenant = connect_control(config)
+        policy_source, policy = load_policy(config, control_client, tenant)
         redactor = build_redactor(config, policy)
     except ValidationError as exc:
         # include_input=False: the rejected value may be a password or key.
         for err in exc.errors(include_input=False, include_url=False):
             logger.error("invalid configuration: %s: %s", err["loc"], err["msg"])
         return 2
+    except control.ControlError as exc:
+        logger.critical("control plane unreachable and no SAFESTREAM_POLICY_FILE: %s", exc)
+        return 1
     except ValueError as exc:
         logger.error("invalid configuration: %s", exc)
         return 2
@@ -1163,7 +1386,10 @@ def main() -> int:
         Producer(config.producer_config()),
         policy_source,
         policy,
+        control_client,
     )
+    if control_client is not None:
+        control_client.start()
     health: HealthServer | None = None
     if config.metrics_port:
         try:
@@ -1188,9 +1414,12 @@ def main() -> int:
         logger.critical("unrecoverable Kafka error, exiting for restart: %s", exc)
         return 1
     finally:
+        if control_client is not None:
+            # After run(): the final audit event is queued by then.
+            control_client.stop(config.flush_timeout_s)
         if health is not None:
             health.stop()
-    return 0
+    return EXIT_CANARY_LEAK if connector.canary_stopped else 0
 
 
 if __name__ == "__main__":

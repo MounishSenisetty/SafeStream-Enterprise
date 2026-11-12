@@ -92,3 +92,25 @@ spec:
               Redaction continues and no counts are lost (each window is carried
               into the next event), but the audit topic is receiving nothing.
               Check the topic exists and the connector may write to it.
+        - alert: SafeStreamCanaryLeak
+          expr: sum(increase(safestream_canary_leaks_total[15m])) > 0
+          labels:
+            severity: critical
+          annotations:
+            summary: A SafeStream leak canary found PII surviving redaction.
+            description: >-
+              Synthetic records with made-up PII came out of the live redactor
+              unredacted. Real records under the same policy may be leaking to
+              the clean topic now. Check which policy version the pod runs
+              (safestream_policy_version) and what changed in it.
+        - alert: SafeStreamControlPlaneUnreachable
+          expr: min(safestream_control_connected) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: SafeStream cannot reach the control plane.
+            description: >-
+              Redaction continues under the policy in force and audit events
+              wait in a queue (safestream_control_queue_depth), but new
+              policies are not arriving. Check egress to the control plane.

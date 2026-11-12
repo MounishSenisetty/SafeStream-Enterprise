@@ -90,13 +90,28 @@ jobs:
       - run: pip install --no-deps -e . && pip install pytest && pip check
       - name: build image
         run: docker build -t safestream-enterprise:ci .
+      # The real Worker, in workerd with local D1 and R2: nothing touches
+      # Cloudflare. tests/test_control_integration.py drives a connector against it.
+      - name: start the control plane locally
+        working-directory: control-plane
+        run: |
+          npm ci --no-audit --no-fund
+          printf 'PLATFORM_ADMIN_TOKEN="ci-platform-admin"\nKEY_ENCRYPTION_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="\n' > "$RUNNER_TEMP/dev.vars"
+          npx wrangler d1 migrations apply DB --local --env staging
+          nohup npx wrangler dev --env staging --local --ip 127.0.0.1 --port 8787 \
+            --env-file "$RUNNER_TEMP/dev.vars" > "$RUNNER_TEMP/wrangler.log" 2>&1 &
+          for _ in $(seq 1 60); do curl -sf http://127.0.0.1:8787/healthz && exit 0; sleep 1; done
+          cat "$RUNNER_TEMP/wrangler.log"
+          exit 1
       - name: integration tests
         env:
           SAFESTREAM_IT_BOOTSTRAP: localhost:9092
           SAFESTREAM_IT_IMAGE: safestream-enterprise:ci
           # Lets the fault-injection test kill and restart the broker.
           SAFESTREAM_IT_KAFKA_CONTAINER: ${{ job.services.kafka.id }}
-        run: pytest -v -rs tests/test_kafka_integration.py
+          SAFESTREAM_IT_CONTROL_URL: http://127.0.0.1:8787
+          SAFESTREAM_IT_PLATFORM_TOKEN: ci-platform-admin
+        run: pytest -v -rs tests/test_kafka_integration.py tests/test_control_integration.py
       - name: image vulnerability scan (fixable HIGH/CRITICAL fail the build)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
@@ -119,6 +134,7 @@ jobs:
           helm template safestream deploy/helm/safestream-enterprise --namespace safestream
           --set autoscaling.enabled=true --set prometheusRule.enabled=true
           --set dashboard.enabled=true --set namespace.create=true
+          --set control.enabled=true --set 'policy.publicKeys={dGVzdC1rZXktbm90LXJlYWw=}'
           | docker run --rm -i ghcr.io/yannh/kubeconform:v0.7.0
           -strict -summary
           -schema-location default
