@@ -5,7 +5,9 @@
 // A caller's tenant always comes from its token, never from the request, so
 // one tenant cannot name another's data.
 
+import { consoleFetch } from "./console";
 import { newTenantKey, newToken, sha256Hex, signBundle } from "./crypto";
+import { delegated, type Principal } from "./principal";
 import { advance, cohort, DEFAULT_SOAK_SECONDS, halt, healthProblem, liveAgents, servedVersion, STAGES, tenantState } from "./rollout";
 import { auditEvent, fieldRules, Invalid, NAME, object_, string_, TENANT } from "./validate";
 
@@ -17,6 +19,15 @@ export interface Env {
   PLATFORM_ADMIN_TOKEN: string;
   /** 32 random bytes, base64. Encrypts tenant signing keys at rest. */
   KEY_ENCRYPTION_KEY: string;
+  /** The console's static pages (Workers static assets). */
+  ASSETS?: Fetcher;
+  /** Host the console is served on (e.g. app.safestreamdata.com); the API is served on every other. */
+  CONSOLE_HOST?: string;
+  /** Cloudflare Access team domain and the console application's audience tag. */
+  ACCESS_TEAM_DOMAIN?: string;
+  ACCESS_AUD?: string;
+  /** Access signing keys as JSON, instead of fetching them. Tests and local runs only. */
+  ACCESS_JWKS?: string;
 }
 
 const MAX_BODY_BYTES = 64 * 1024;
@@ -37,14 +48,6 @@ const json = (body: unknown, status = 200, headers: Record<string, string> = {})
 
 const now = (): string => new Date().toISOString();
 
-interface Principal {
-  tenant: string;
-  kind: "admin" | "agent";
-  /** The token's id (first 12 hex digits of its hash) and label. */
-  id: string;
-  label: string;
-}
-
 function bearer(request: Request): string {
   const header = request.headers.get("authorization") ?? "";
   if (!header.startsWith("Bearer ")) throw new HttpError(401, "unauthenticated", "Bearer token required");
@@ -52,6 +55,12 @@ function bearer(request: Request): string {
 }
 
 async function authenticate(request: Request, env: Env, kind: Principal["kind"]): Promise<Principal> {
+  // A console session, already verified by console.ts (Access identity, role).
+  const session = delegated.get(request);
+  if (session) {
+    if (session.kind !== kind) throw new HttpError(403, "forbidden", `This route needs a tenant ${kind} token`);
+    return session;
+  }
   const hash = await sha256Hex(bearer(request));
   const row = await env.DB.prepare(
     "SELECT tenant_id, kind, label FROM tokens WHERE hash = ? AND revoked_at IS NULL",
@@ -326,6 +335,183 @@ async function listChains(request: Request, env: Env): Promise<Response> {
   return json({ chains: results });
 }
 
+/** One version: its state and its field rules, decoded from the signed bundle. */
+async function policyDetail(request: Request, env: Env, versionText: string): Promise<Response> {
+  const { tenant } = await authenticate(request, env, "admin");
+  const version = Number(versionText);
+  const row = await env.DB.prepare(
+    `SELECT p.version, 'sha256:' || p.digest AS digest, p.rule_count AS rules, p.created_at,
+            t.active_version, t.candidate_version, t.rollout_version, t.key_id
+       FROM policies p JOIN tenants t ON t.id = p.tenant_id WHERE p.tenant_id = ? AND p.version = ?`,
+  )
+    .bind(tenant, version)
+    .first<{ version: number; digest: string; rules: number; created_at: string; active_version: number | null; candidate_version: number | null; rollout_version: number | null; key_id: string }>();
+  if (!row) throw new HttpError(404, "not_found", "No such version");
+  const stored = await env.POLICIES.get(bundleKey(tenant, version));
+  if (!stored) throw new HttpError(500, "internal", "Policy bundle is missing from storage");
+  const bundle = (await stored.json()) as { payload: string };
+  const payload = JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(bundle.payload), (c) => c.charCodeAt(0)))) as {
+    issued_at: string;
+    field_rules: unknown;
+  };
+  const state =
+    row.version === row.rollout_version
+      ? "rolling_out"
+      : row.version === row.active_version
+        ? "active"
+        : row.version === row.candidate_version
+          ? "candidate"
+          : (row.active_version ?? 0) > row.version
+            ? "superseded"
+            : "published";
+  return json({
+    version: row.version,
+    state,
+    digest: row.digest,
+    rules: row.rules,
+    key_id: row.key_id,
+    created_at: row.created_at,
+    issued_at: payload.issued_at,
+    field_rules: payload.field_rules,
+  });
+}
+
+/**
+ * The fleet's shadow evaluation of the candidate, summed over the connectors
+ * evaluating it now: what promoting it would change, as counts.
+ */
+async function shadowReport(request: Request, env: Env): Promise<Response> {
+  const { tenant } = await authenticate(request, env, "admin");
+  const state = await env.DB.prepare("SELECT active_version, candidate_version FROM tenants WHERE id = ?")
+    .bind(tenant)
+    .first<{ active_version: number | null; candidate_version: number | null }>();
+  const candidate = state?.candidate_version ?? null;
+  const since = new Date(Date.now() - 10 * 60_000).toISOString();
+  const { results } = candidate
+    ? await env.DB.prepare(
+        `SELECT instance, policy_version, shadow_since, shadow_records, shadow_changed_records, shadow_errors,
+                shadow_active, shadow_candidate
+           FROM agents WHERE tenant_id = ? AND shadow_version = ? AND last_seen_at >= ? LIMIT 5000`,
+      )
+        .bind(tenant, candidate, since)
+        .all<{ instance: string; policy_version: number | null; shadow_since: string | null; shadow_records: number | null; shadow_changed_records: number | null; shadow_errors: number | null; shadow_active: string | null; shadow_candidate: string | null }>()
+    : { results: [] };
+  const active: Record<string, number> = {};
+  const proposed: Record<string, number> = {};
+  let records = 0;
+  let changed = 0;
+  let errors = 0;
+  for (const a of results) {
+    records += a.shadow_records ?? 0;
+    changed += a.shadow_changed_records ?? 0;
+    errors += a.shadow_errors ?? 0;
+    for (const [entity, n] of Object.entries(JSON.parse(a.shadow_active ?? "{}") as Record<string, number>))
+      active[entity] = (active[entity] ?? 0) + n;
+    for (const [entity, n] of Object.entries(JSON.parse(a.shadow_candidate ?? "{}") as Record<string, number>))
+      proposed[entity] = (proposed[entity] ?? 0) + n;
+  }
+  const entities = [...new Set([...Object.keys(active), ...Object.keys(proposed)])].sort();
+  return json({
+    active_version: state?.active_version ?? null,
+    candidate_version: candidate,
+    agents: results.map((a) => ({ instance: a.instance, policy_version: a.policy_version, since: a.shadow_since, records: a.shadow_records })),
+    records,
+    changed_records: changed,
+    errors,
+    // Per entity type: redactions under the policy in force, under the
+    // candidate, and the difference promoting it would make.
+    entities: entities.map((entity) => ({
+      entity,
+      active: active[entity] ?? 0,
+      candidate: proposed[entity] ?? 0,
+      delta: (proposed[entity] ?? 0) - (active[entity] ?? 0),
+    })),
+  });
+}
+
+/**
+ * Every stored event of one audit chain, in order, as NDJSON: the evidence
+ * for "safestream-audit verify", with the anchored head in a header.
+ */
+async function exportChain(request: Request, env: Env, chainId: string): Promise<Response> {
+  const { tenant } = await authenticate(request, env, "admin");
+  const chain = await env.DB.prepare("SELECT head, broken, closed FROM chains WHERE tenant_id = ? AND chain_id = ?")
+    .bind(tenant, chainId)
+    .first<{ head: string; broken: number; closed: number }>();
+  if (!chain) throw new HttpError(404, "not_found", "No such chain");
+  const prefix = `tenants/${tenant}/chains/${chainId}/`;
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  const write = async () => {
+    const writer = writable.getWriter();
+    const newline = new TextEncoder().encode("\n");
+    try {
+      let cursor: string | undefined;
+      do {
+        // Keys are "<seq, zero-padded>-<hash prefix>.json": listing order is chain order.
+        const page = await env.AUDIT.list({ prefix, cursor, limit: 1000 });
+        for (const object of page.objects) {
+          const stored = await env.AUDIT.get(object.key);
+          if (!stored) continue;
+          await writer.write(new Uint8Array(await stored.arrayBuffer()));
+          await writer.write(newline);
+        }
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+      await writer.close();
+    } catch (err) {
+      await writer.abort(err);
+    }
+  };
+  void write();
+  return new Response(readable, {
+    headers: {
+      "content-type": "application/x-ndjson",
+      "content-disposition": `attachment; filename="${chainId}.ndjson"`,
+      "cache-control": "no-store",
+      "x-safestream-chain-head": chain.head,
+      "x-safestream-chain-broken": String(chain.broken),
+      "x-safestream-chain-closed": String(chain.closed),
+    },
+  });
+}
+
+const EMAIL = /^[^\s@]{1,64}@[A-Za-z0-9.-]{1,190}\.[A-Za-z]{2,24}$/;
+
+async function listConsoleUsers(request: Request, env: Env): Promise<Response> {
+  const { tenant } = await authenticate(request, env, "admin");
+  const { results } = await env.DB.prepare(
+    "SELECT email, role, created_at FROM console_users WHERE tenant_id = ? ORDER BY email",
+  )
+    .bind(tenant)
+    .all();
+  return json({ users: results });
+}
+
+/** Give a person (their Access email) console access to this tenant, or change their role. */
+async function grantConsoleUser(request: Request, env: Env): Promise<Response> {
+  const { tenant } = await authenticate(request, env, "admin");
+  const input = object_((await body(request)).json, "user", ["email", "role"]);
+  const email = string_(input.email, "user.email", EMAIL).toLowerCase();
+  const role = input.role ?? "viewer";
+  if (role !== "viewer" && role !== "admin") throw new Invalid("user.role: must be one of viewer, admin");
+  await env.DB.prepare(
+    `INSERT INTO console_users (email, tenant_id, role, created_at) VALUES (?, ?, ?, ?)
+     ON CONFLICT (email, tenant_id) DO UPDATE SET role = excluded.role`,
+  )
+    .bind(email, tenant, role, now())
+    .run();
+  return json({ email, role }, 201);
+}
+
+async function removeConsoleUser(request: Request, env: Env): Promise<Response> {
+  const { tenant } = await authenticate(request, env, "admin");
+  const input = object_((await body(request)).json, "user", ["email"]);
+  const email = string_(input.email, "user.email", EMAIL).toLowerCase();
+  const done = await env.DB.prepare("DELETE FROM console_users WHERE email = ? AND tenant_id = ?").bind(email, tenant).run();
+  if (!done.meta.changes) throw new HttpError(404, "not_found", "No such console user");
+  return json({ removed: email });
+}
+
 // ---------------------------------------------------------------------------
 // agents (connectors)
 // ---------------------------------------------------------------------------
@@ -408,15 +594,22 @@ async function telemetry(request: Request, env: Env): Promise<Response> {
     chainUpdate,
     env.DB.prepare(
       `INSERT INTO agents (tenant_id, instance, first_seen_at, last_seen_at, connector_version, policy_version, shadow_version,
-                           window_reported_at, window_egress, window_dlq, window_canary_checks, window_canary_leaks)
-       VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?3, ?7, ?8, ?9, ?10)
+                           window_reported_at, window_egress, window_dlq, window_canary_checks, window_canary_leaks,
+                           shadow_since, shadow_records, shadow_changed_records, shadow_errors, shadow_active, shadow_candidate)
+       VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, ?3, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
        ON CONFLICT (tenant_id, instance) DO UPDATE SET
          last_seen_at = ?3, connector_version = ?4, policy_version = ?5, shadow_version = ?6,
          window_reported_at = ?3, window_egress = ?7, window_dlq = ?8,
-         window_canary_checks = ?9, window_canary_leaks = ?10`,
+         window_canary_checks = ?9, window_canary_leaks = ?10,
+         shadow_since = ?11, shadow_records = ?12, shadow_changed_records = ?13, shadow_errors = ?14,
+         shadow_active = ?15, shadow_candidate = ?16`,
     ).bind(
       tenant, event.instance, at, event.connectorVersion, event.policyVersion, event.shadowVersion,
       event.records.egress, event.records.dlq, event.canary?.checks ?? null, event.canary?.leaks ?? null,
+      event.shadow?.since ?? null, event.shadow?.records ?? null, event.shadow?.changedRecords ?? null,
+      event.shadow?.errors ?? null,
+      event.shadow ? JSON.stringify(event.shadow.active) : null,
+      event.shadow ? JSON.stringify(event.shadow.candidate) : null,
     ),
   ]);
   await judgeRollout(env, tenant, event.instance);
@@ -451,6 +644,7 @@ const routes: [method: string, pattern: RegExp, handler: Handler][] = [
   ["POST", /^\/v1\/tokens\/([0-9a-f]{12})\/revoke$/, revokeToken],
   ["POST", /^\/v1\/policies$/, publishPolicy],
   ["GET", /^\/v1\/policies$/, listPolicies],
+  ["GET", /^\/v1\/policies\/([1-9][0-9]{0,8})$/, policyDetail],
   ["POST", /^\/v1\/policies\/([1-9][0-9]{0,8})\/promote$/, promotePolicy],
   ["POST", /^\/v1\/policies\/candidate\/withdraw$/, withdrawCandidate],
   ["GET", /^\/v1\/rollout$/, getRollout],
@@ -458,32 +652,54 @@ const routes: [method: string, pattern: RegExp, handler: Handler][] = [
   ["POST", /^\/v1\/rollout\/resume$/, resumeRollout],
   ["GET", /^\/v1\/agents$/, listAgents],
   ["GET", /^\/v1\/chains$/, listChains],
+  ["GET", /^\/v1\/chains\/([A-Za-z0-9][A-Za-z0-9._-]{0,252})\/events$/, exportChain],
+  ["GET", /^\/v1\/shadow$/, shadowReport],
+  ["GET", /^\/v1\/console-users$/, listConsoleUsers],
+  ["POST", /^\/v1\/console-users$/, grantConsoleUser],
+  ["POST", /^\/v1\/console-users\/remove$/, removeConsoleUser],
   ["GET", /^\/v1\/agent\/whoami$/, whoami],
   ["GET", /^\/v1\/agent\/policy\/(active|candidate)$/, (rq, env, which) => agentPolicy(rq, env, which as "active")],
   ["POST", /^\/v1\/agent\/telemetry$/, telemetry],
 ];
 
+async function route(request: Request, env: Env, pathname: string): Promise<Response> {
+  try {
+    let pathMatched = false;
+    for (const [method, pattern, handler] of routes) {
+      const match = pattern.exec(pathname);
+      if (!match) continue;
+      pathMatched = true;
+      if (method === request.method) return await handler(request, env, ...match.slice(1));
+    }
+    throw pathMatched
+      ? new HttpError(405, "method_not_allowed", "Method not allowed")
+      : new HttpError(404, "not_found", "No such route");
+  } catch (err) {
+    if (err instanceof HttpError) return json({ error: err.code, message: err.message }, err.status);
+    if (err instanceof Invalid) return json({ error: "invalid", message: err.message }, 422);
+    // Never echo an unexpected error to the caller; it is in the Worker's logs.
+    console.error(err);
+    return json({ error: "internal", message: "Internal error" }, 500);
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const { pathname } = new URL(request.url);
-    if (pathname === "/healthz") return json({ ok: true });
-    try {
-      let pathMatched = false;
-      for (const [method, pattern, handler] of routes) {
-        const match = pattern.exec(pathname);
-        if (!match) continue;
-        pathMatched = true;
-        if (method === request.method) return await handler(request, env, ...match.slice(1));
+    const url = new URL(request.url);
+    // The console's host serves the console and nothing else; every other
+    // host serves the API and never the console.
+    if (env.CONSOLE_HOST && url.hostname === env.CONSOLE_HOST) {
+      try {
+        return await consoleFetch(request, env, (rq, pathname, principal) => {
+          delegated.set(rq, principal);
+          return route(rq, env, pathname);
+        });
+      } catch (err) {
+        console.error(err);
+        return json({ error: "internal", message: "Internal error" }, 500);
       }
-      throw pathMatched
-        ? new HttpError(405, "method_not_allowed", "Method not allowed")
-        : new HttpError(404, "not_found", "No such route");
-    } catch (err) {
-      if (err instanceof HttpError) return json({ error: err.code, message: err.message }, err.status);
-      if (err instanceof Invalid) return json({ error: "invalid", message: err.message }, 422);
-      // Never echo an unexpected error to the caller; it is in the Worker's logs.
-      console.error(err);
-      return json({ error: "internal", message: "Internal error" }, 500);
     }
+    if (url.pathname === "/healthz") return json({ ok: true });
+    return route(request, env, url.pathname);
   },
 } satisfies ExportedHandler<Env>;

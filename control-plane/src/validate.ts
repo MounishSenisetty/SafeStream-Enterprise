@@ -60,6 +60,15 @@ export interface AuditEvent {
   connectorVersion: string;
   policyVersion: number | null;
   shadowVersion: number | null;
+  /** The shadow comparison, cumulative since `since`; null without a candidate. */
+  shadow: {
+    since: string;
+    records: number;
+    changedRecords: number;
+    errors: number;
+    active: Record<string, number>;
+    candidate: Record<string, number>;
+  } | null;
   chain: { id: string; seq: number; prev: string | null };
   final: boolean;
   records: { egress: number; dlq: number };
@@ -91,6 +100,7 @@ export function auditEvent(value: unknown, tenant: string): AuditEvent {
     policyVersion = ref.version;
   }
   let shadowVersion: number | null = null;
+  let shadow: AuditEvent["shadow"] = null;
   if (e.shadow !== null) {
     const s = object(e.shadow, "event.shadow", [
       "candidate", "since", "records", "changed_records", "errors", "redactions",
@@ -99,8 +109,14 @@ export function auditEvent(value: unknown, tenant: string): AuditEvent {
     text(s.since, "event.shadow.since", TIME);
     for (const k of ["records", "changed_records", "errors"]) count(s[k], `event.shadow.${k}`);
     const r = object(s.redactions, "event.shadow.redactions", ["active", "candidate"]);
-    entityCounts(r.active, "event.shadow.redactions.active");
-    entityCounts(r.candidate, "event.shadow.redactions.candidate");
+    shadow = {
+      since: s.since as string,
+      records: s.records as number,
+      changedRecords: s.changed_records as number,
+      errors: s.errors as number,
+      active: entityCounts(r.active, "event.shadow.redactions.active"),
+      candidate: entityCounts(r.candidate, "event.shadow.redactions.candidate"),
+    };
   }
 
   const chain = object(e.chain, "event.chain", ["id", "seq", "prev"]);
@@ -125,6 +141,7 @@ export function auditEvent(value: unknown, tenant: string): AuditEvent {
     connectorVersion: text(e.connector_version, "event.connector_version", VERSION),
     policyVersion,
     shadowVersion,
+    shadow,
     chain: {
       id: text(chain.id, "event.chain.id", NAME),
       seq: count(chain.seq, "event.chain.seq"),

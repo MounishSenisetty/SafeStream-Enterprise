@@ -91,14 +91,18 @@ jobs:
       - name: build image
         run: docker build -t safestream-enterprise:ci .
       # The real Worker, in workerd with local D1 and R2: nothing touches
-      # Cloudflare. tests/test_control_integration.py drives a connector against it.
+      # Cloudflare. tests/test_control_integration.py drives a connector against
+      # it, and e2e/console.e2e.mjs drives the console in a browser. A throwaway
+      # key stands in for Cloudflare Access's signing key.
       - name: start the control plane locally
         working-directory: control-plane
         run: |
           npm ci --no-audit --no-fund
+          node e2e/access-key.mjs "$RUNNER_TEMP/access"
           printf 'PLATFORM_ADMIN_TOKEN="ci-platform-admin"\nKEY_ENCRYPTION_KEY="AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="\n' > "$RUNNER_TEMP/dev.vars"
-          npx wrangler d1 migrations apply DB --local --env staging
-          nohup npx wrangler dev --env staging --local --ip 127.0.0.1 --port 8787 \
+          cat "$RUNNER_TEMP/access/access.vars" >> "$RUNNER_TEMP/dev.vars"
+          npx wrangler d1 migrations apply DB --local --env local
+          nohup npx wrangler dev --env local --local --ip 127.0.0.1 --port 8787 \
             --env-file "$RUNNER_TEMP/dev.vars" > "$RUNNER_TEMP/wrangler.log" 2>&1 &
           for _ in $(seq 1 60); do curl -sf http://127.0.0.1:8787/healthz && exit 0; sleep 1; done
           cat "$RUNNER_TEMP/wrangler.log"
@@ -112,6 +116,15 @@ jobs:
           SAFESTREAM_IT_CONTROL_URL: http://127.0.0.1:8787
           SAFESTREAM_IT_PLATFORM_TOKEN: ci-platform-admin
         run: pytest -v -rs tests/test_kafka_integration.py tests/test_control_integration.py
+      - name: console end to end (Playwright, against the same Worker)
+        working-directory: control-plane
+        env:
+          E2E_KEY_DIR: ${{ runner.temp }}/access
+          E2E_PLATFORM_TOKEN: ci-platform-admin
+        run: |
+          npm install --no-save --no-audit --no-fund playwright@1.63.0
+          npx playwright install --with-deps chromium
+          node e2e/console.e2e.mjs
       - name: image vulnerability scan (fixable HIGH/CRITICAL fail the build)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:

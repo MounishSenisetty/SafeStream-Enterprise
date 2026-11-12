@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SafeStream console</title>
+    <link rel="stylesheet" href="/console.css" />
+    <script type="module" src="/console.js"></script>
+  </head>
+  <body>
+    <header class="bar">
+      <strong class="brand">SafeStream</strong>
+      <nav id="tabs" aria-label="Sections">
+        <button type="button" data-tab="fleet" aria-current="page">Fleet</button>
+        <button type="button" data-tab="policies">Policies</button>
+        <button type="button" data-tab="rollout">Rollout</button>
+        <button type="button" data-tab="evidence">Audit evidence</button>
+        <button type="button" data-tab="access">Access</button>
+      </nav>
+      <span class="who">
+        <label for="tenant" class="sr-only">Tenant</label>
+        <select id="tenant" hidden></select>
+        <span id="role" class="badge"></span>
+        <span id="email"></span>
+      </span>
+    </header>
+    <p id="notice" role="status" hidden></p>
+    <main id="view" aria-live="polite"></main>
+    <noscript>The console needs JavaScript.</noscript>
+  </body>
+</html>

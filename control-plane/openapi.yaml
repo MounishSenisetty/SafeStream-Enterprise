@@ -6,7 +6,9 @@ info:
     Signs and distributes redaction policies and keeps what connectors report
     about themselves. It never receives record content: the one upload route
     accepts counts, names, versions and hashes, and refuses anything else.
-    A caller's tenant always comes from its token.
+    A caller's tenant always comes from its token. The same tenant-admin routes are reachable
+    from the console (app.safestreamdata.com) as /console/api/<route without /v1>, by a person
+    signed in through Cloudflare Access with a console role instead of a token.
 servers:
   - url: https://api.safestreamdata.com
   - url: https://api-staging.safestreamdata.com
@@ -145,6 +147,60 @@ paths:
       responses:
         "200": { description: "state is rolling_out (with its first stage) or active" }
         default: { $ref: "#/components/responses/Error" }
+  /v1/policies/{version}:
+    get:
+      summary: One version, its state and its field rules (decoded from the signed bundle)
+      security: [{ tenantAdmin: [] }]
+      parameters: [{ name: version, in: path, required: true, schema: { type: integer, minimum: 1 } }]
+      responses: { "200": { description: "version, state, digest, key_id, field_rules" }, default: { $ref: "#/components/responses/Error" } }
+  /v1/shadow:
+    get:
+      summary: The fleet's shadow evaluation of the candidate, summed
+      description: >-
+        Over the connectors evaluating the candidate now: records compared, records that would
+        be redacted differently, and per entity type the redactions under the policy in force,
+        under the candidate, and the difference. Counts only.
+      security: [{ tenantAdmin: [] }]
+      responses: { "200": { description: shadow report }, default: { $ref: "#/components/responses/Error" } }
+  /v1/chains/{chain}/events:
+    get:
+      summary: Every stored event of one audit chain, in order, as NDJSON
+      description: >-
+        Byte for byte as the connector published them; the anchored head is in
+        x-safestream-chain-head. Check with "safestream-audit verify FILE --head CHAIN=HEAD".
+      security: [{ tenantAdmin: [] }]
+      parameters: [{ name: chain, in: path, required: true, schema: { type: string, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$" } }]
+      responses:
+        "200": { description: events, content: { application/x-ndjson: {} } }
+        default: { $ref: "#/components/responses/Error" }
+  /v1/console-users:
+    get:
+      summary: People with console access to this tenant, and their roles
+      security: [{ tenantAdmin: [] }]
+      responses: { "200": { description: users }, default: { $ref: "#/components/responses/Error" } }
+    post:
+      summary: Give a person (their Cloudflare Access email) a console role, or change it
+      security: [{ tenantAdmin: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [email]
+              properties:
+                email: { type: string, format: email }
+                role: { enum: [viewer, admin], default: viewer }
+      responses: { "201": { description: granted }, default: { $ref: "#/components/responses/Error" } }
+  /v1/console-users/remove:
+    post:
+      summary: Take a person's console access to this tenant away
+      security: [{ tenantAdmin: [] }]
+      requestBody:
+        required: true
+        content: { application/json: { schema: { type: object, additionalProperties: false, required: [email], properties: { email: { type: string } } } } }
+      responses: { "200": { description: removed }, default: { $ref: "#/components/responses/Error" } }
   /v1/rollout:
     get:
       summary: Where the rollout of a promoted version stands

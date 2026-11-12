@@ -7,6 +7,12 @@ declare namespace Cloudflare {
     PLATFORM_ADMIN_TOKEN: string;
     KEY_ENCRYPTION_KEY: string;
     TEST_MIGRATIONS: import("@cloudflare/vitest-plugin").D1Migration[];
+    ASSETS: Fetcher;
+    CONSOLE_HOST: string;
+    ACCESS_TEAM_DOMAIN: string;
+    ACCESS_AUD: string;
+    ACCESS_JWKS: string;
+    TEST_ACCESS_PRIVATE_JWK: string;
   }
 }
 

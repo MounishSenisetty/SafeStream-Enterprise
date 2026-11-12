@@ -11,11 +11,16 @@ Terraform for everything on the domain. Nothing here is applied from a laptop: t
 | `dns.tf` | CAA limited to Cloudflare's CAs; null MX, SPF `-all` and DMARC `reject` (the domain sends no mail, so nobody can spoof it); the site's records |
 | `site.tf` | Pages project for the public site, its two custom domains, the `www` to apex redirect |
 | `waf.tf` | Custom firewall rules (API host closed by default, scanner noise blocked), one rate-limit rule, managed rulesets on paid plans |
+| `access.tf` | Cloudflare Access applications for the console hosts (`app`, `app-staging`) and the policy saying who may sign in (`console_allowed_emails`, `console_allowed_email_domains`; none by default, which keeps the console closed) |
 | `storage.tf` | Per environment: a D1 database and R2 buckets for policy bundles and audit evidence; optional write-once lock on production audit evidence |
 
 It does not create the zone (the domain was registered through Cloudflare) and will not
 delete it. The control-plane Worker and its `api` and `api-staging` hosts are deployed by
-Wrangler from `control-plane/`; Access for the console arrives with the console.
+Wrangler from `control-plane/`, and so are the console's `app` and `app-staging` hosts;
+Access in front of those hosts is managed here (`access.tf`). Identity providers (each design
+partner's OIDC or SAML IdP) and the Zero Trust team name are set up once in the Zero Trust
+dashboard; put the team domain (`<team>.cloudflareaccess.com`) in the repository variable
+`ACCESS_TEAM_DOMAIN`.
 
 ## One-time setup
 
@@ -24,7 +29,7 @@ Wrangler from `control-plane/`; Access for the console arrives with the console.
 2. **API token** for Terraform, scoped to this account and zone, with:
    Zone: *Zone Read*, *Zone Settings Edit*, *DNS Edit*, *Zone WAF Edit*, *Dynamic Redirect
    Edit*, *Workers Routes Edit*; Account: *Cloudflare Pages Edit*, *D1 Edit*, *Workers R2
-   Storage Edit*, *Workers Scripts Edit*.
+   Storage Edit*, *Workers Scripts Edit*, *Access: Apps and Policies Edit*.
 3. **GitHub**, under Settings → Secrets and variables → Actions:
 
    | Kind | Name | Value |
@@ -58,6 +63,9 @@ Read the plan in the workflow log. Three things deserve a look on a live domain:
 | `zone_plan` | `free` | `pro` or above also deploys the Cloudflare Managed and OWASP rulesets |
 | `audit_lock_days` | `0` | Days production audit evidence cannot be deleted or overwritten. Cannot be shortened for objects already written |
 | `api_rate_limit_per_10s` | `100` | Per-IP ceiling on the API host |
+| `console_allowed_emails`, `console_allowed_email_domains` | none | Who Access lets through to the console. Each person still needs a role from a tenant admin |
+| `console_identity_providers` | all | Zero Trust identity provider ids the console accepts |
+| `console_session_duration` | `8h` | Console sign-in lifetime |
 | `hsts_max_age`, `hsts_preload` | 180 days, `false` | See above |
 
 Set them as `TF_VAR_<name>` in the workflow, or in a `terraform.tfvars` that holds no secrets.
