@@ -5,8 +5,8 @@ Skipped unless ``SAFESTREAM_IT_CONTROL_URL`` names a running Worker and
 with ``wrangler dev`` (local D1 and R2, nothing touches Cloudflare):
 
     cd control-plane
-    npx wrangler d1 migrations apply DB --local --env staging
-    npx wrangler dev --env staging --local --port 8787 --env-file <file with the two secrets>
+    npx wrangler d1 migrations apply DB --local --env local
+    npx wrangler dev --env local --local --port 8787 --env-file <file with the two secrets>
 
 Kafka is the in-memory fake here: the broker paths have their own integration
 tests, and this one is about the HTTP contract, end to end: enrollment,

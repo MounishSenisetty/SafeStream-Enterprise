@@ -14,6 +14,13 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - An unknown `LOG_LEVEL` falls back to `INFO` with a warning instead of a traceback.
 
 ### Added
+- Console at `app.safestreamdata.com`, behind Cloudflare Access (`infra/cloudflare/access.tf`):
+  fleet health, policies with rule diffs and the fleet's shadow diff, a policy editor, rollout
+  control, audit-evidence export for offline verification, and console-user and connector-token
+  management. The Worker verifies the Access token itself and maps the email to a tenant role
+  (`viewer` or `admin`) granted with `POST /v1/console-users`. New API routes:
+  `GET /v1/policies/{version}`, `GET /v1/shadow`, `GET /v1/chains/{chain}/events`,
+  `/v1/console-users`. Migration 0003. A Playwright test drives it in CI.
 - Control-plane uplink (`SAFESTREAM_CONTROL_URL`, `SAFESTREAM_CONTROL_TOKEN`, off by default).
   The connector pulls signed policies and candidates from the control plane and verifies them
   itself. It pushes its audit events there to anchor the hash chain, outbound HTTPS only. Audit

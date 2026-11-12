@@ -29,3 +29,8 @@ output "r2_buckets" {
     }
   }
 }
+
+output "console_access_aud" {
+  description = "Audience tag of each console Access application: the Worker's ACCESS_AUD."
+  value       = { for env, app in cloudflare_zero_trust_access_application.console : env => app.aud }
+}

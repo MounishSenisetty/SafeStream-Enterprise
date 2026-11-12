@@ -4,15 +4,42 @@
 // Secrets, set once per environment with "wrangler secret put <NAME> --env <env>":
 //   PLATFORM_ADMIN_TOKEN   creates tenants; long and random
 //   KEY_ENCRYPTION_KEY     openssl rand -base64 32; encrypts tenant signing keys
+// The console is served on CONSOLE_HOST, behind Cloudflare Access (infra/cloudflare/access.tf).
+// ACCESS_AUD and ACCESS_TEAM_DOMAIN are filled in at deploy time like the D1 ids; without
+// them the console answers 503 and lets nobody in.
 {
   "name": "safestream-control-plane",
   "main": "src/index.ts",
   "compatibility_date": "2026-10-01",
   "workers_dev": false,
   "observability": { "enabled": true },
+  // The console's pages. The Worker runs first on every request, so it decides
+  // which host serves them and adds the security headers.
+  "assets": { "directory": "./console", "binding": "ASSETS", "run_worker_first": true, "not_found_handling": "single-page-application" },
   "env": {
+    // For wrangler dev, CI and the e2e test only; never deployed. No routes, so
+    // wrangler dev keeps each request's own Host: the console answers on
+    // CONSOLE_HOST (localhost) and the API on any other host (127.0.0.1).
+    "local": {
+      "d1_databases": [
+        { "binding": "DB", "database_name": "safestream-local", "database_id": "local", "migrations_dir": "migrations" }
+      ],
+      "r2_buckets": [
+        { "binding": "POLICIES", "bucket_name": "safestream-local-policies" },
+        { "binding": "AUDIT", "bucket_name": "safestream-local-audit" }
+      ],
+      "vars": { "CONSOLE_HOST": "localhost" }
+    },
     "staging": {
-      "routes": [{ "pattern": "api-staging.safestreamdata.com", "custom_domain": true }],
+      "routes": [
+        { "pattern": "api-staging.safestreamdata.com", "custom_domain": true },
+        { "pattern": "app-staging.safestreamdata.com", "custom_domain": true }
+      ],
+      "vars": {
+        "CONSOLE_HOST": "app-staging.safestreamdata.com",
+        "ACCESS_TEAM_DOMAIN": "ACCESS_TEAM_DOMAIN_VALUE",
+        "ACCESS_AUD": "ACCESS_AUD_STAGING"
+      },
       "d1_databases": [
         { "binding": "DB", "database_name": "safestream-staging", "database_id": "D1_ID_STAGING", "migrations_dir": "migrations" }
       ],
@@ -22,7 +49,15 @@
       ]
     },
     "production": {
-      "routes": [{ "pattern": "api.safestreamdata.com", "custom_domain": true }],
+      "routes": [
+        { "pattern": "api.safestreamdata.com", "custom_domain": true },
+        { "pattern": "app.safestreamdata.com", "custom_domain": true }
+      ],
+      "vars": {
+        "CONSOLE_HOST": "app.safestreamdata.com",
+        "ACCESS_TEAM_DOMAIN": "ACCESS_TEAM_DOMAIN_VALUE",
+        "ACCESS_AUD": "ACCESS_AUD_PRODUCTION"
+      },
       "d1_databases": [
         { "binding": "DB", "database_name": "safestream-production", "database_id": "D1_ID_PRODUCTION", "migrations_dir": "migrations" }
       ],

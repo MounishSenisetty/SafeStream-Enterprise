@@ -469,9 +469,9 @@ describe("documentation", () => {
     const spec = (await import("../openapi.yaml?raw")).default as string;
     const source = (await import("../src/index.ts?raw")).default as string;
     const served = [...source.matchAll(/\["(GET|POST)", \/\^(.+?)\$\/,/g)].map((m) =>
-      m[2]!.replaceAll("\\/", "/").replace(/\((?:\[0-9a-f\]\{12\})\)/, "{id}").replace(/\(\[1-9\].*?\)/, "{version}").replace("(active|candidate)", "{which}"),
+      m[2]!.replaceAll("\\/", "/").replace(/\((?:\[0-9a-f\]\{12\})\)/, "{id}").replace(/\(\[1-9\].*?\)/, "{version}").replace("(active|candidate)", "{which}").replace("([A-Za-z0-9][A-Za-z0-9._-]{0,252})", "{chain}"),
     );
-    expect(served.length).toBe(16);
+    expect(served.length).toBe(22);
     for (const path of served) expect(spec, path).toContain(`  ${path}:`);
   });
 });

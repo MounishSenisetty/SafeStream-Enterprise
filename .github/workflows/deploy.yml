@@ -83,9 +83,12 @@ jobs:
       # locked and changes are rare. Pass the plan as an artifact if that gap matters.
       - run: terraform -chdir=infra/cloudflare apply -auto-approve -lock-timeout=5m
       - id: outputs
-        run: echo "d1=$(terraform -chdir=infra/cloudflare output -json d1_database_ids)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "d1=$(terraform -chdir=infra/cloudflare output -json d1_database_ids)" >> "$GITHUB_OUTPUT"
+          echo "aud=$(terraform -chdir=infra/cloudflare output -json console_access_aud)" >> "$GITHUB_OUTPUT"
     outputs:
       d1_database_ids: ${{ steps.outputs.outputs.d1 }}
+      console_access_aud: ${{ steps.outputs.outputs.aud }}
 
   control-plane:
     name: deploy the control plane
@@ -99,13 +102,19 @@ jobs:
     env:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       D1_IDS: ${{ needs.apply.outputs.d1_database_ids }}
+      ACCESS_AUDS: ${{ needs.apply.outputs.console_access_aud }}
+      # <team>.cloudflareaccess.com, from the Zero Trust dashboard.
+      ACCESS_TEAM_DOMAIN: ${{ vars.ACCESS_TEAM_DOMAIN }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: npm ci --no-audit --no-fund
       - run: npm test
-      - name: fill in the D1 database ids from Terraform
+      - name: fill in the D1 database ids and the console's Access settings from Terraform
         run: |
           sed -i "s/D1_ID_STAGING/$(echo "$D1_IDS" | jq -r .staging)/; s/D1_ID_PRODUCTION/$(echo "$D1_IDS" | jq -r .production)/" wrangler.jsonc
+          sed -i "s/ACCESS_AUD_STAGING/$(echo "$ACCESS_AUDS" | jq -r .staging)/; s/ACCESS_AUD_PRODUCTION/$(echo "$ACCESS_AUDS" | jq -r .production)/" wrangler.jsonc
+          # Unset: the placeholder is replaced by nothing, and the console stays closed (503).
+          sed -i "s/ACCESS_TEAM_DOMAIN_VALUE/${ACCESS_TEAM_DOMAIN}/" wrangler.jsonc
       - name: staging
         env:
           SECRETS: ${{ secrets.CONTROL_PLANE_SECRETS_STAGING }}

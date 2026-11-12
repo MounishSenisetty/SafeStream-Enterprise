@@ -45,6 +45,49 @@ event is checked field by field against an allow-list of counts, names, versions
   curl -sS https://api.safestreamdata.com/v1/rollout -H "authorization: Bearer $ADMIN_TOKEN"
   ```
 
+## Console
+
+`app.safestreamdata.com` (staging: `app-staging.safestreamdata.com`), served by this same
+Worker from `console/` (Workers static assets). No passwords and no tokens in the browser:
+
+- **Two locks.** Cloudflare Access lets a person in through their own identity provider
+  (`infra/cloudflare/access.tf`). The Worker then verifies Access's signed token itself
+  (`src/access.ts`: RS256 against the team's certs, this application's audience, the issuer,
+  the lifetime) and looks the email up in `console_users`. A person Access lets in still sees
+  nothing until a tenant admin grants them a role. A missing or bad token gets nothing, not
+  even the static page, so a misconfigured Access fails closed.
+- **One API.** `/console/api/<route>` is the tenant-admin route `/v1/<route>`, run by the same
+  handlers with the person's tenant and role in place of a token (`src/console.ts`). Agent
+  routes and tenant creation are not reachable from the console. The console host serves
+  nothing else, and the API hosts never serve the console.
+- **Roles.** `viewer` reads. `admin` also publishes, rolls out, issues and revokes connector
+  tokens, and manages console users. Someone in several tenants picks one; their role follows it.
+- **Changes are guarded and logged.** A change must come from the console's own page: same
+  origin, plus a header a cross-site form cannot set. Each change is logged as
+  `{"event": "console_change", email, tenant, method, route}`, never with a body.
+- **Strict page.** A content security policy allowing only the console's own script and
+  connections, no framing, `nosniff`, no referrer. Nothing from the API is ever put into the
+  page as HTML.
+
+What it shows: fleet health (connectors reporting, silent ones, canary leaks, DLQ rates); the
+policies with each version's rules, the rule diff against the version in force, and the
+fleet's **shadow diff** (`GET /v1/shadow`: "this candidate would redact 600 more `id_number`
+values and 0 fewer of anything"); a policy editor that signs and publishes the next version;
+rollout control (staged or immediate, resume, abort, withdraw); **audit evidence export**
+(`GET /v1/chains/{chain}/events`, every stored event byte for byte, with the anchored head);
+and access management (console users, connector tokens).
+
+Give someone access:
+
+```bash
+curl -sS https://api.safestreamdata.com/v1/console-users \
+  -H "authorization: Bearer $ADMIN_TOKEN" -d '{"email": "ana@acme.example", "role": "admin"}'
+```
+
+Access must also let them through (`console_allowed_emails` or `console_allowed_email_domains`
+in Terraform). Deploying needs the repository variable `ACCESS_TEAM_DOMAIN`; Terraform supplies
+each application's audience tag.
+
 ## Develop
 
 ```bash
@@ -52,7 +95,32 @@ npm ci && npm test
 ```
 
 Tests run inside workerd, the production runtime, with local D1 and R2. Nothing touches
-Cloudflare. CI also runs the Worker with `wrangler dev` and drives a real connector against it
+Cloudflare. A throwaway RSA key stands in for Access's signing key, so the tests can mint
+Access tokens, including forged, expired and wrong-audience ones.
+
+Run it locally with the `local` environment (no routes, so `wrangler dev` keeps each request's
+Host: the console answers on `localhost`, the API on `127.0.0.1`):
+
+```bash
+node e2e/access-key.mjs /tmp/ss
+```
+
+```bash
+printf 'PLATFORM_ADMIN_TOKEN="ci-platform-admin"\nKEY_ENCRYPTION_KEY="%s"\n' "$(openssl rand -base64 32)" | cat - /tmp/ss/access.vars > /tmp/ss/dev.vars
+```
+
+```bash
+npx wrangler d1 migrations apply DB --local --env local && npx wrangler dev --env local --ip 127.0.0.1 --env-file /tmp/ss/dev.vars
+```
+
+```bash
+E2E_KEY_DIR=/tmp/ss node e2e/console.e2e.mjs
+```
+
+The last command is the browser test CI runs: Playwright drives the console through sign-in,
+fleet, publishing, the shadow diff, a staged rollout that halts on a leak canary, export and
+offline verification with `safestream-audit`, token issuance, and a viewer who cannot change
+anything. CI also runs the Worker with `wrangler dev` and drives a real connector against it
 (`tests/test_control_integration.py` in the repository root). `test/fixtures/audit-event.json`
 is an event as the connector builds it: the Python tests keep it in step with the connector,
 and the tests here must accept it.
@@ -86,7 +154,6 @@ must trust (`SAFESTREAM_POLICY_PUBLIC_KEYS`).
 
 ## Not built yet
 
-- No web console: the API is the interface.
 - During a rollout, the cohort is recomputed on every active-policy request (a hash per live
   connector). That is fine for fleets of hundreds; a large fleet would cache it per stage.
 - Telemetry is written in the request, not through a queue. At one event per connector per

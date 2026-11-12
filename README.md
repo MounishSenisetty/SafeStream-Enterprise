@@ -484,6 +484,11 @@ plane cannot be reached within `SAFESTREAM_CONTROL_STARTUP_TIMEOUT_S`, it starts
 `SAFESTREAM_POLICY_FILE` if one is mounted. Otherwise it exits (code 1) and is restarted:
 it never consumes without a policy.
 
+**Console.** Tenants manage all of this from `app.safestreamdata.com`, behind Cloudflare Access
+with their own identity provider: fleet health, policies and the fleet's shadow diff, rollout
+control, and audit evidence to export and verify offline (see
+[`control-plane/README.md`](control-plane/README.md)).
+
 **Staged rollout.** Promoting a policy on the control plane rolls it out in stages: to one
 connector, then to a tenth of the fleet, then to all of it. A stage ends when every connector
 in it has reported an audit window under the new version and the soak time (default 10

@@ -49,3 +49,27 @@ variable "api_rate_limit_per_10s" {
   type        = number
   default     = 100
 }
+
+variable "console_allowed_emails" {
+  description = "People Access lets through to the console, by email. They still see nothing until a tenant admin grants them a role (POST /v1/console-users)."
+  type        = list(string)
+  default     = []
+}
+
+variable "console_allowed_email_domains" {
+  description = "Email domains Access lets through to the console (e.g. a design partner's company domain). Same second check as above."
+  type        = list(string)
+  default     = []
+}
+
+variable "console_identity_providers" {
+  description = "Zero Trust identity provider ids the console accepts. Empty: every identity provider configured in the account."
+  type        = list(string)
+  default     = []
+}
+
+variable "console_session_duration" {
+  description = "How long a console sign-in lasts before Access asks again."
+  type        = string
+  default     = "8h"
+}
