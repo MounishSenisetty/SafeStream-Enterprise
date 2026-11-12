@@ -296,3 +296,62 @@ describe("what the console shows", () => {
     expect((await call(API, "GET", "/v1/chains/pod-x-chain/events", { token: other.admin })).status).toBe(404);
   });
 });
+
+describe("hardening", () => {
+  it("refuses an oversized body before holding it, even one streamed without a length", async () => {
+    const t = await tenant();
+    const chunk = new TextEncoder().encode("x".repeat(16 * 1024));
+    let sent = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (sent++ < 64) controller.enqueue(chunk); // 1 MiB in total, never announced
+        else controller.close();
+      },
+    });
+    const r = await SELF.fetch(API + "/v1/policies", {
+      method: "POST",
+      headers: { authorization: `Bearer ${t.admin}` },
+      body: stream,
+      // @ts-expect-error workerd's fetch takes duplex for a streamed request body
+      duplex: "half",
+    });
+    expect(r.status).toBe(413);
+    expect(sent).toBeLessThan(64); // stopped reading once over the cap
+  });
+
+  it("fetches Access's keys at most once a minute, however many tokens name an unknown key", async () => {
+    const { verifyAccessJwt } = await import("../src/access");
+    const realFetch = globalThis.fetch;
+    let fetches = 0;
+    globalThis.fetch = (async () => {
+      fetches += 1;
+      return Response.json({ keys: JSON.parse(env.ACCESS_JWKS).keys });
+    }) as typeof fetch;
+    try {
+      const config = { teamDomain: "test-team.cloudflareaccess.com", audience: "test-console-aud" };
+      for (let i = 0; i < 5; i++) {
+        const token = await accessJwt("x@acme.example", {}, { kid: `rotated-${i}` });
+        await expect(verifyAccessJwt(token, config)).rejects.toThrow("unknown key");
+      }
+      expect(fetches).toBe(1);
+      expect(await verifyAccessJwt(await accessJwt("x@acme.example"), config)).toBe("x@acme.example");
+      expect(fetches).toBe(1);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it("never trusts static test keys on a real console host", async () => {
+    const { consoleFetch } = await import("../src/console");
+    const { staticKeysAllowed } = await import("../src/access");
+    expect(staticKeysAllowed("app.safestreamdata.com")).toBe(false);
+    expect(staticKeysAllowed("localhost")).toBe(true);
+    expect(staticKeysAllowed("app.test")).toBe(true);
+    const r = await consoleFetch(
+      new Request("https://app.safestreamdata.com/console/api/me", { headers: { "cf-access-jwt-assertion": await accessJwt("x@acme.example") } }),
+      { DB: env.DB, CONSOLE_HOST: "app.safestreamdata.com", ACCESS_TEAM_DOMAIN: "test-team.cloudflareaccess.com", ACCESS_AUD: "test-console-aud", ACCESS_JWKS: env.ACCESS_JWKS },
+      async () => new Response("dispatched"),
+    );
+    expect(r.status).toBe(503);
+  });
+});

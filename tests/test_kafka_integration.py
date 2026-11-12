@@ -117,9 +117,13 @@ def drain(topic: str, expected: int, timeout_s: float = 60.0) -> list[Message]:
 def committed_lag(group: str, topic: str) -> int:
     """Records in ``topic`` not yet covered by ``group``'s committed offset."""
     c = Consumer({"bootstrap.servers": BOOTSTRAP, "group.id": group})
-    (tp,) = c.committed([TopicPartition(topic, 0)], timeout=10)
-    _, high = c.get_watermark_offsets(tp, timeout=10)
-    c.close()
+    try:
+        (tp,) = c.committed([TopicPartition(topic, 0)], timeout=10)
+        _, high = c.get_watermark_offsets(tp, timeout=10)
+    finally:
+        # Also when the broker is down: an unclosed consumer keeps reconnecting
+        # in the background for the rest of the run.
+        c.close()
     return high - max(tp.offset, 0)
 
 
@@ -450,7 +454,9 @@ def test_policy_is_swapped_under_load_without_a_restart(
 
 @pytest.mark.skipif(not KAFKA_CONTAINER, reason="SAFESTREAM_IT_KAFKA_CONTAINER not set")
 @pytest.mark.parametrize("delivery", ["at_least_once", "exactly_once"])
-def test_broker_killed_mid_stream_loses_nothing(topics: dict[str, str], delivery: str) -> None:
+def test_broker_killed_mid_stream_loses_nothing(
+    topics: dict[str, str], delivery: str, tmp_path: Path
+) -> None:
     """Kill the broker under load and run the real connector process, restarted
     whenever it exits, as Kubernetes would. Every record must arrive, and in
     exactly_once only once.
@@ -490,12 +496,29 @@ def test_broker_killed_mid_stream_loses_nothing(topics: dict[str, str], delivery
         except KafkaException:
             return n  # broker down: nothing is known to be committed
 
+    logs: list[Path] = []
+
     def start() -> subprocess.Popen[bytes]:
-        return subprocess.Popen(
-            [sys.executable, "-m", "safestream_enterprise.connectors.kafka"],
-            env=env,
-            stderr=subprocess.DEVNULL,
-        )
+        # Each process's log is kept: when recovery fails, it is the evidence.
+        logs.append(tmp_path / f"connector-{len(logs)}.log")
+        with logs[-1].open("wb") as log:
+            return subprocess.Popen(
+                [sys.executable, "-m", "safestream_enterprise.connectors.kafka"],
+                env=env,
+                stderr=log,
+            )
+
+    def connector_logs() -> str:
+        """The connector's own lines (librdkafka's reconnect noise left out), last 40 per run."""
+        out = []
+        for path in logs:
+            lines = [
+                line
+                for line in path.read_text(errors="replace").splitlines()
+                if "safestream_enterprise" in line or "Traceback" in line or "Error" in line
+            ]
+            out.append(f"--- {path.name}\n" + "\n".join(lines[-40:]))
+        return "\n".join(out)
 
     exits: list[int] = []
     process = start()
@@ -510,7 +533,9 @@ def test_broker_killed_mid_stream_loses_nothing(topics: dict[str, str], delivery
 
         deadline = time.monotonic() + 300
         while lag() > 0:
-            assert time.monotonic() < deadline, f"never caught up; exit codes so far: {exits}"
+            assert time.monotonic() < deadline, (
+                f"never caught up; exit codes so far: {exits}\n{connector_logs()}"
+            )
             code = process.poll()
             if code is not None:
                 exits.append(code)

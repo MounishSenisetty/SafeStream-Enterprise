@@ -125,6 +125,20 @@ jobs:
           npm install --no-save --no-audit --no-fund playwright@1.63.0
           npx playwright install --with-deps chromium
           node e2e/console.e2e.mjs
+      # Not a benchmark (shared runners are too noisy for numbers): it fails if
+      # any request errors when a simulated fleet polls and reports concurrently,
+      # with and without a rollout in progress.
+      - name: control-plane load smoke test
+        working-directory: control-plane
+        run: |
+          node load/fleet.mjs --url http://127.0.0.1:8787 --platform-token ci-platform-admin --connectors 100 --speedup 4 --seconds 15
+          node load/fleet.mjs --url http://127.0.0.1:8787 --platform-token ci-platform-admin --connectors 100 --speedup 4 --seconds 15 --rollout
+      # Restores D1 from an export into an empty database and proves the Worker
+      # runs on it: tokens, bundles, chain heads, offline-verifiable evidence,
+      # and signing keys that still decrypt.
+      - name: backup and restore drill
+        working-directory: control-plane
+        run: drills/restore-drill.sh
       - name: image vulnerability scan (fixable HIGH/CRITICAL fail the build)
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:

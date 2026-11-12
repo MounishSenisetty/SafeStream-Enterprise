@@ -38,6 +38,8 @@ nav:
   - Documentation: guide.md
   - Benchmarks: benchmarks.md
   - Security: security.md
+  - Security review: security-review.md
+  - Runbooks: runbooks.md
   - Changelog: changelog.md
 
 hooks:

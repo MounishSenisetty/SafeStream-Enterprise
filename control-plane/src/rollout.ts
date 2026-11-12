@@ -98,6 +98,27 @@ export async function cohort(tenant: string, rollout: Rollout, live: AgentRow[])
 }
 
 /**
+ * The current stage's cohort, remembered per isolate for COHORT_CACHE_MS.
+ * Working it out reads every live connector and hashes each name; on the
+ * active-policy route, which every connector polls, that made a rollout
+ * halve the Worker's throughput (load/fleet.mjs). A cohort only changes when
+ * the fleet or the stage does, and a new stage is a new cache key, so the
+ * cost is a new connector joining a stage up to this much later.
+ */
+const COHORT_CACHE_MS = 15_000;
+const cohortCache = new Map<string, { at: number; members: Set<string> }>();
+
+async function cachedCohort(db: D1Database, tenant: string, rollout: Rollout, now: Date): Promise<Set<string>> {
+  const key = `${tenant}:${rollout.version}:${rollout.stage}:${rollout.stageStartedAt}`;
+  const hit = cohortCache.get(key);
+  if (hit && now.getTime() - hit.at < COHORT_CACHE_MS) return hit.members;
+  const members = new Set(await cohort(tenant, rollout, await liveAgents(db, tenant, now)));
+  if (cohortCache.size > 1000) cohortCache.clear(); // bounded: one entry per tenant in a rollout
+  cohortCache.set(key, { at: now.getTime(), members });
+  return members;
+}
+
+/**
  * The version to serve as "active" to one connector: the rollout's version
  * if it is in the current cohort, otherwise the tenant's active version. A
  * connector is never served less than it already runs (it would refuse it).
@@ -114,8 +135,8 @@ export async function servedVersion(db: D1Database, tenant: string, instance: st
     running = row?.policy_version ?? null;
   }
   if (rollout && !rollout.haltedReason && instance) {
-    const members = await cohort(tenant, rollout, await liveAgents(db, tenant, now));
-    if (members.includes(instance)) version = Math.max(version ?? 0, rollout.version);
+    const members = await cachedCohort(db, tenant, rollout, now);
+    if (members.has(instance)) version = Math.max(version ?? 0, rollout.version);
   }
   if (running !== null && running > (version ?? 0)) {
     // Only if that version exists for this tenant (an agent reports its own).
