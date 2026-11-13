@@ -72,6 +72,10 @@ REGEX_PREFIX = "re:"
 #: Longest key whose classification is memoised (see ``classify_key``).
 MAX_CACHED_KEY_LENGTH = 256
 
+#: Longest value whose scan result is memoised (see ``redact_scalar``). Short
+#: values (levels, hosts, routes, status text) are the ones that repeat.
+MAX_CACHED_VALUE_LENGTH = 256
+
 # Key normalisation strips everything but letters/digits, so one rule matches
 # every spelling: ``LastName``, ``last_name``, ``last-name``, ``LAST NAME``.
 # Rule patterns keep the glob wildcards ``*`` and ``?``.
@@ -223,6 +227,7 @@ class StructuredRedactor:
         *,
         scan_free_text: bool = True,
         key_cache_size: int = 4096,
+        value_cache_size: int = 65536,
     ) -> None:
         self.redactor = redactor if redactor is not None else Redactor()
         self.scan_free_text = scan_free_text
@@ -253,6 +258,15 @@ class StructuredRedactor:
         # Per-instance cache (a module-level one would leak rules across
         # instances). lru_cache is thread-safe for concurrent readers.
         self._classify_cached = lru_cache(maxsize=key_cache_size)(self._classify_key)
+        # Scan results for short values, keyed by a 128-bit BLAKE2b digest so the
+        # values themselves (which may be personal data) are not kept. Each entry
+        # is the redacted text (None: nothing found) and the entity types found.
+        # The engine's output for a given string never changes, so a hit is
+        # exactly what scanning again would give; per-call overhead is most of
+        # the cost of a short value. 0 turns it off.
+        self._value_cache: dict[bytes, tuple[str | None, tuple[str, ...]]] = {}
+        self._value_cache_size = value_cache_size
+        self.value_cache_hits = 0
 
     # ------------------------------------------------------------------
     # key classification
@@ -313,12 +327,29 @@ class StructuredRedactor:
             return value
         # Strings, and integers (a card number logged as a JSON number).
         text = value if isinstance(value, str) else str(value)
+        key = None
+        if self._value_cache_size and len(text) <= MAX_CACHED_VALUE_LENGTH:
+            key = hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=16).digest()
+            hit = self._value_cache.get(key)
+            if hit is not None:
+                self.value_cache_hits += 1
+                redacted, found = hit
+                if stats is not None and found:
+                    stats.counts.update(found)
+                return value if redacted is None else redacted
         detections = self.redactor.detect(text)
-        if not detections:
-            return value
-        if stats is not None:
-            stats.counts.update(d.entity_type.value for d in detections)
-        return self.redactor.policy.apply(text, detections)
+        found = tuple(d.entity_type.value for d in detections)
+        redacted = self.redactor.policy.apply(text, detections) if detections else None
+        if key is not None:
+            if len(self._value_cache) >= self._value_cache_size:
+                # ponytail: clear when full instead of LRU; a steady stream
+                # refills the hot values within one batch. Use LRU if the
+                # metrics ever show a working set near the cap.
+                self._value_cache.clear()
+            self._value_cache[key] = (redacted, found)
+        if stats is not None and found:
+            stats.counts.update(found)
+        return value if redacted is None else redacted
 
     def redact_tree(self, root: JSONValue, stats: RedactionStats | None = None) -> JSONValue:
         """Redact a parsed JSON tree **in place** and return it.

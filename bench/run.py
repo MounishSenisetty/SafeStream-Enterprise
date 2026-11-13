@@ -68,26 +68,59 @@ def xml_record(rng: random.Random) -> bytes:
     ).encode()
 
 
+ROUTES = [
+    f"/api/v1/{r}/{a}"
+    for r in ("orders", "users", "carts", "search", "items")
+    for a in "abcdefghij"
+]
+HOSTS = [f"web-{i:02d}.prod.internal" for i in range(20)]
+AGENTS = [f"Mozilla/5.0 (client {i})" for i in range(10)]
+
+
+def access_record(rng: random.Random) -> bytes:
+    """An HTTP access-log event: 50 routes, 20 hosts, 10 agents, a handful of
+    statuses and methods; the request id and client IP are unique."""
+    return json.dumps(
+        {
+            "ts": "2026-11-10T08:00:00.000Z",
+            "request_id": f"{rng.getrandbits(64):016x}",
+            "method": rng.choice(["GET", "GET", "GET", "POST", "PUT", "DELETE"]),
+            "path": rng.choice(ROUTES),
+            "status": rng.choice([200, 200, 200, 201, 204, 301, 404, 500]),
+            "host": rng.choice(HOSTS),
+            "user_agent": rng.choice(AGENTS),
+            "client_ip": f"10.{rng.randrange(256)}.{rng.randrange(256)}.{rng.randrange(256)}",
+            "duration_ms": rng.randrange(2000),
+        }
+    ).encode()
+
+
 WORKLOADS: dict[str, Callable[[random.Random], bytes]] = {
     "JSON, small": lambda rng: json_record(rng, 2),
     "JSON, large": lambda rng: json_record(rng, 40),
     "XML event": xml_record,
+    "JSON, access log": access_record,
 }
 
 
 def bench_engine(make: Callable[[random.Random], bytes], seconds: float) -> dict[str, float]:
+    """Every record is generated fresh and redacted once: replaying the same
+    records would turn the redactor's value cache into a false speedup."""
     rng = random.Random(7)
-    records = [make(rng) for _ in range(2000)]
     redactor = StructuredRedactor()
-    for r in records[:200]:  # warm caches
-        redactor.redact_line(r)
-    done, started = 0, time.perf_counter()
-    while (elapsed := time.perf_counter() - started) < seconds:
-        for r in records:
+    for _ in range(200):  # warm-up: imports, compiled patterns
+        redactor.redact_line(make(random.Random(rng.random())))
+    done = size = 0
+    elapsed = 0.0
+    while elapsed < seconds:
+        chunk = [make(rng) for _ in range(1000)]  # generated outside the timing
+        started = time.perf_counter()
+        for r in chunk:
             redactor.redact_line(r)
-        done += len(records)
-    size = sum(map(len, records)) / len(records)
-    return {"bytes": size, "rate": done / elapsed, "mb_s": done * size / elapsed / 1e6}
+        elapsed += time.perf_counter() - started
+        done += len(chunk)
+        size += sum(map(len, chunk))
+    return {"bytes": size / done, "rate": done / elapsed, "mb_s": size / elapsed / 1e6}
 
 
 def bench_kafka(bootstrap: str, delivery: str, n: int) -> float:

@@ -180,8 +180,8 @@ autoscaling:
   minReplicas: 1
   # Keep at or below the ingress topic's partition count.
   maxReplicas: 12
-  # Target lag per replica. One replica clears about 2,000 small records/s
-  # (docs/benchmarks.md), so 60000 is roughly 30 seconds of backlog.
+  # Target lag per replica. One replica clears about 3,800 small records/s
+  # (docs/benchmarks.md), so 60000 is roughly 15 seconds of backlog.
   lagThreshold: 60000
 
 # Alerts, for the Prometheus Operator.

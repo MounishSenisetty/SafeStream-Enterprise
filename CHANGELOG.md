@@ -78,6 +78,9 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 - `LICENSE`, `SECURITY.md`, `CODEOWNERS` and this changelog.
 
 ### Changed
+- Redaction is 1.7 to 5.6 times faster per core, depending on how much the data repeats: each
+  redactor remembers scan results for short values, keyed by a digest so no value is kept.
+  Output and counts are unchanged. Numbers in `docs/benchmarks.md`.
 - Audit event schema is now `safestream.audit/v2` (adds `chain`, `shadow` and `policy`; no
   field was removed).
 - New dependency: `cryptography` (Ed25519).

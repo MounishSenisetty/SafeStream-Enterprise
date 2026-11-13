@@ -1,42 +1,57 @@
 # Benchmarks
 
-Measured with `bench/run.py` on SafeStream Enterprise 0.3.0 (safestream-redactor 0.5.0),
+Measured with `bench/run.py` on SafeStream Enterprise 0.3.0+ (safestream-redactor 0.5.0),
 CPython 3.13, one core of an Intel Xeon at 2.1 GHz, against a single-node Kafka 4.3 broker on
-the same machine. Records are synthetic application log events; every one carries an email
-address, a name, an IP address and free text.
+the same machine. Every record is generated fresh and redacted once (see "The value cache"
+below for why that matters). Every record carries personal data.
 
-| Engine workload | Avg record | Records/s per core | MB/s per core |
-|---|---|---|---|
-| JSON, small | 368 B | 2,799 | 1.0 |
-| JSON, large | 1,790 B | 544 | 1.0 |
-| XML event | 302 B | 3,313 | 1.0 |
+| Engine workload | Avg record | Records/s per core | MB/s per core | Without the value cache |
+|---|---|---|---|---|
+| JSON, small: app log with email, name, IP, free text | 368 B | 5,251 | 1.9 | 3,059 |
+| JSON, large: the same with 40 more text attributes | 1,790 B | 4,155 | 7.4 | 566 |
+| XML event: Windows-style logon event | 301 B | 8,324 | 2.5 | 3,843 |
+| JSON, access log: 50 routes, 20 hosts, 10 agents; unique request id and IP | 250 B | 19,069 | 4.8 | 3,415 |
 
-| End to end (JSON, small; one connector, one partition) | Records/s |
-|---|---|
-| at_least_once | 2,439 |
-| exactly_once | 2,361 |
+| End to end (JSON, small; one connector, one partition) | Records/s | Without the value cache |
+|---|---|---|
+| at_least_once | 3,981 | 2,439 |
+| exactly_once | 3,828 | 2,361 |
 
 ## Reading the numbers
 
-- **About 1 MB/s per core, whatever the record shape.** Cost follows the bytes scanned, not the
-  record count.
-- **Kafka is not the bottleneck.** End to end is within 15% of the engine alone, and
-  exactly-once costs about 3% over at-least-once.
-- **Sizing.** One connector pod handles roughly 2,400 small records per second, about 200
-  million a day. Throughput scales with pods up to the ingress topic's partition count, so
-  size partitions as peak records per second divided by 2,000.
+- **Throughput depends on how much your logs repeat.** Values that recur (levels, hosts,
+  routes, user agents, status text) are scanned once; unique ones (request ids, addresses,
+  free-text messages) every time. Access logs, which are mostly repetition, run five times
+  faster than before the cache; application logs with a unique message per line, about 1.7
+  times. The large-JSON gain overstates real logs: its synthetic attributes draw on an
+  eleven-word vocabulary, so they repeat far more than real text would.
+- **Kafka is not the bottleneck.** End to end is within about 25% of the engine alone, and
+  exactly-once costs about 4% over at-least-once.
+- **Sizing.** Measure your own records (below). As a starting point, one connector pod
+  handles about 3,800 small application-log records per second, about 330 million a day.
+  Throughput scales with pods up to the ingress topic's partition count.
 
-## Where the time goes
+## The value cache
 
-A profile of the small-JSON workload puts over 90% of the time in the open-source engine's
-content detectors (`safestream_redactor.Redactor.detect`), which run in pure Python: the
-0.5.0 wheel on PyPI is `py3-none-any` and carries no compiled extension, so `backend="auto"`
-falls back to Python. JSON parsing, field rules and serialisation in this package account for
-under 10%.
+Most of the time goes to the open-source engine's content detectors
+(`safestream_redactor.Redactor.detect`), which run in pure Python: the 0.5.0 wheel on PyPI is
+`py3-none-any`, so `backend="auto"` falls back to Python. Each call costs about 20 µs before
+it has looked at a single character, and a record is scanned one value at a time, so on short
+values most of the cost was that fixed overhead.
 
-So the next step for throughput is in the engine, not in this repository: shipping the engine's
-native backend as binary wheels would lift every number above. Until then the lever is
-partitions and pods.
+So each redactor remembers the result for values up to 256 characters: the redacted text and
+the entity types found, keyed by a 128-bit BLAKE2b digest of the value. The value itself is
+not kept, since it may be personal data. The engine's output for a given string never changes,
+so a cache hit is exactly what scanning again would give, and redaction counts stay exact. A
+property test checks output and counts against an uncached redactor in every mode. Up to
+65,536 entries (a few MB); the cache starts over when full, and a new policy builds a new
+redactor with an empty one.
+
+Joining a record's values into one call would cut the overhead further, but neighbouring text
+can change what the detectors find, and a missed detection is not an acceptable price for speed.
+
+The next step for throughput is still in the engine, not in this repository: shipping its
+native backend as binary wheels would lift every number above.
 
 ## Reproducing
 
