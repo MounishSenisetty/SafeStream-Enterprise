@@ -72,9 +72,36 @@ async function authenticate(request: Request, env: Env, kind: Principal["kind"])
   return { tenant: row.tenant_id, kind: row.kind, id: hash.slice(0, 12), label: row.label };
 }
 
+/** The body, read with a cap: an oversized one is refused before it is held in memory. */
+async function readCapped(request: Request): Promise<Uint8Array<ArrayBuffer>> {
+  const tooLarge = () => new HttpError(413, "too_large", "Request body is too large");
+  const declared = Number(request.headers.get("content-length") ?? "0");
+  if (declared > MAX_BODY_BYTES) throw tooLarge();
+  if (!request.body) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_BODY_BYTES) {
+      await reader.cancel();
+      throw tooLarge();
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let at = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, at);
+    at += chunk.byteLength;
+  }
+  return bytes;
+}
+
 async function body(request: Request, optional = false): Promise<{ bytes: Uint8Array<ArrayBuffer>; json: unknown }> {
-  const bytes = new Uint8Array(await request.arrayBuffer());
-  if (bytes.length > MAX_BODY_BYTES) throw new HttpError(413, "too_large", "Request body is too large");
+  const bytes = await readCapped(request);
   if (optional && bytes.length === 0) return { bytes, json: {} };
   try {
     return { bytes, json: JSON.parse(new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes)) };

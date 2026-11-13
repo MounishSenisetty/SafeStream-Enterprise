@@ -5,6 +5,13 @@ Notable changes to SafeStream Enterprise. Versions follow [semantic versioning](
 ## Unreleased
 
 ### Fixed
+- Control plane: request bodies are refused once over 64 KiB, without being read whole into
+  memory first; a console token naming an unknown key refetches Access's keys at most once a
+  minute; the test-only `ACCESS_JWKS` is ignored on a real console host, where the console
+  refuses to serve. Found in the Phase 9 security review (`docs/security-review.md`).
+- Control plane: during a staged rollout, the cohort is cached per stage instead of being
+  recomputed from every live connector on every active-policy request, which halved
+  throughput (found by `load/fleet.mjs`).
 - Kafka connector: a watchdog exits the process (code 3) when the main loop stalls. After a
   broker crash, a transactional client call could block indefinitely, past its timeout,
   leaving a connector that consumed nothing until something outside restarted it.

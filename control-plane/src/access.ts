@@ -25,7 +25,18 @@ interface Jwk extends JsonWebKey {
 
 const CLOCK_SKEW_S = 60;
 const KEYS_TTL_MS = 60 * 60 * 1000;
+/** A token naming an unknown key triggers at most one refetch per this period. */
+const KEYS_REFRESH_MIN_MS = 60 * 1000;
 let cachedKeys: { url: string; at: number; keys: Jwk[] } | null = null;
+
+/**
+ * Static keys (ACCESS_JWKS) are for tests and local runs: honoured only when the
+ * console is served on localhost or a .test host, so a stray variable in a real
+ * deployment cannot let whoever holds that key sign in.
+ */
+export function staticKeysAllowed(consoleHost: string | undefined): boolean {
+  return consoleHost === "localhost" || consoleHost === "127.0.0.1" || (consoleHost ?? "").endsWith(".test");
+}
 
 const b64urlBytes = (text: string): Uint8Array<ArrayBuffer> =>
   Uint8Array.from(atob(text.replaceAll("-", "+").replaceAll("_", "/") + "===".slice((text.length + 3) % 4)), (c) =>
@@ -45,7 +56,11 @@ function b64urlJson(text: string): Record<string, unknown> {
 async function keys(config: AccessConfig, refresh: boolean): Promise<Jwk[]> {
   if (config.jwks) return (JSON.parse(config.jwks) as { keys: Jwk[] }).keys;
   const url = `https://${config.teamDomain}/cdn-cgi/access/certs`;
-  if (!refresh && cachedKeys && cachedKeys.url === url && Date.now() - cachedKeys.at < KEYS_TTL_MS) return cachedKeys.keys;
+  if (cachedKeys && cachedKeys.url === url) {
+    const age = Date.now() - cachedKeys.at;
+    // A rotation is looked for at most once a minute, however many tokens name an unknown key.
+    if (age < KEYS_TTL_MS && (!refresh || age < KEYS_REFRESH_MIN_MS)) return cachedKeys.keys;
+  }
   const response = await fetch(url, { headers: { accept: "application/json" } });
   if (!response.ok) throw new AccessDenied("cannot fetch Access signing keys");
   const body = (await response.json()) as { keys?: Jwk[] };

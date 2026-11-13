@@ -9,7 +9,7 @@
 // publishes, promotes, rolls out and manages tokens and console users. Every
 // change is logged (who, which tenant, which route; never a body).
 
-import { AccessDenied, verifyAccessJwt } from "./access";
+import { AccessDenied, staticKeysAllowed, verifyAccessJwt } from "./access";
 import type { Principal } from "./principal";
 
 export interface ConsoleEnv {
@@ -58,6 +58,10 @@ export type Dispatch = (request: Request, pathname: string, principal: Principal
 export async function consoleFetch(request: Request, env: ConsoleEnv, dispatch: Dispatch): Promise<Response> {
   if (!env.ACCESS_TEAM_DOMAIN || !env.ACCESS_AUD)
     return problem(503, "not_configured", "The console is not configured on this deployment");
+  if (env.ACCESS_JWKS && !staticKeysAllowed(env.CONSOLE_HOST)) {
+    console.error("ACCESS_JWKS is set on a real console host; refusing to serve the console");
+    return problem(503, "not_configured", "The console is misconfigured on this deployment");
+  }
 
   let email: string;
   try {
