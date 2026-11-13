@@ -123,6 +123,12 @@ jobs:
         env:
           SECRETS: ${{ secrets.CONTROL_PLANE_SECRETS_STAGING }}
         run: |
+          # Without its two secrets the Worker cannot create tenants or sign
+          # policies: refuse to deploy rather than ship one that looks healthy.
+          if ! echo "$SECRETS" | jq -e '.PLATFORM_ADMIN_TOKEN and .KEY_ENCRYPTION_KEY' > /dev/null 2>&1; then
+            echo "::error::Secret CONTROL_PLANE_SECRETS_STAGING must be JSON with PLATFORM_ADMIN_TOKEN and KEY_ENCRYPTION_KEY (see control-plane/README.md)"
+            exit 1
+          fi
           npx wrangler d1 migrations apply safestream-staging --env staging --remote
           npx wrangler deploy --env staging
           echo "$SECRETS" | npx wrangler secret bulk --env staging
@@ -131,6 +137,12 @@ jobs:
         env:
           SECRETS: ${{ secrets.CONTROL_PLANE_SECRETS_PRODUCTION }}
         run: |
+          # Without its two secrets the Worker cannot create tenants or sign
+          # policies: refuse to deploy rather than ship one that looks healthy.
+          if ! echo "$SECRETS" | jq -e '.PLATFORM_ADMIN_TOKEN and .KEY_ENCRYPTION_KEY' > /dev/null 2>&1; then
+            echo "::error::Secret CONTROL_PLANE_SECRETS_PRODUCTION must be JSON with PLATFORM_ADMIN_TOKEN and KEY_ENCRYPTION_KEY (see control-plane/README.md)"
+            exit 1
+          fi
           npx wrangler d1 migrations apply safestream-production --env production --remote
           npx wrangler deploy --env production
           echo "$SECRETS" | npx wrangler secret bulk --env production
