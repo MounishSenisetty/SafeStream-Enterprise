@@ -63,7 +63,7 @@ Read the plan in the workflow log. Three things deserve a look on a live domain:
 | `zone_plan` | `free` | `pro` or above also deploys the Cloudflare Managed and OWASP rulesets |
 | `audit_lock_days` | `0` | Days production audit evidence cannot be deleted or overwritten. Cannot be shortened for objects already written |
 | `api_rate_limit_per_10s` | `100` | Per-IP ceiling on the API host |
-| `console_allowed_emails`, `console_allowed_email_domains` | none | Who Access lets through to the console. Each person still needs a role from a tenant admin |
+| `console_allowed_emails`, `console_allowed_email_domains` | none | Who Access lets through to the console. Each person still needs a role from a tenant admin. The Deploy workflow reads them from the repository variables `CONSOLE_ALLOWED_EMAILS` and `CONSOLE_ALLOWED_EMAIL_DOMAINS`, as JSON lists (`["you@example.com"]`) |
 | `console_identity_providers` | all | Zero Trust identity provider ids the console accepts |
 | `console_session_duration` | `8h` | Console sign-in lifetime |
 | `hsts_max_age`, `hsts_preload` | 180 days, `false` | See above |
