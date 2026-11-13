@@ -1,0 +1,3 @@
+# Local Worker secrets (wrangler reads these from the project folder). Never commit.
+.dev.vars*
+.env*
