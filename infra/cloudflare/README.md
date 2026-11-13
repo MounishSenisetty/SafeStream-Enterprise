@@ -9,7 +9,7 @@ Terraform for everything on the domain. Nothing here is applied from a laptop: t
 |---|---|
 | `zone.tf` | Looks up the existing zone; DNSSEC; TLS settings (Full strict, TLS 1.2+, TLS 1.3, HTTPS everywhere, HSTS) |
 | `dns.tf` | CAA limited to Cloudflare's CAs; null MX, SPF `-all` and DMARC `reject` (the domain sends no mail, so nobody can spoof it); the site's records |
-| `site.tf` | Pages project for the public site, its two custom domains, the `www` to apex redirect |
+| `site.tf` | Pages project for the public site and its custom domain, `docs.safestreamdata.com`. The apex and `www` are served by a Worker managed outside this configuration, which also owns their redirect rules |
 | `waf.tf` | Custom firewall rules (API host closed by default, scanner noise blocked), one rate-limit rule, managed rulesets on paid plans |
 | `access.tf` | Cloudflare Access applications for the console hosts (`app`, `app-staging`) and the policy saying who may sign in (`console_allowed_emails`, `console_allowed_email_domains`; none by default, which keeps the console closed) |
 | `storage.tf` | Per environment: a D1 database and R2 buckets for policy bundles and audit evidence; optional write-once lock on production audit evidence |
@@ -63,7 +63,7 @@ Read the plan in the workflow log. Three things deserve a look on a live domain:
 | `zone_plan` | `free` | `pro` or above also deploys the Cloudflare Managed and OWASP rulesets |
 | `audit_lock_days` | `0` | Days production audit evidence cannot be deleted or overwritten. Cannot be shortened for objects already written |
 | `api_rate_limit_per_10s` | `100` | Per-IP ceiling on the API host |
-| `console_allowed_emails`, `console_allowed_email_domains` | none | Who Access lets through to the console. Each person still needs a role from a tenant admin |
+| `console_allowed_emails`, `console_allowed_email_domains` | none | Who Access lets through to the console. Each person still needs a role from a tenant admin. The Deploy workflow reads them from the repository variables `CONSOLE_ALLOWED_EMAILS` and `CONSOLE_ALLOWED_EMAIL_DOMAINS`, as JSON lists (`["you@example.com"]`) |
 | `console_identity_providers` | all | Zero Trust identity provider ids the console accepts |
 | `console_session_duration` | `8h` | Console sign-in lifetime |
 | `hsts_max_age`, `hsts_preload` | 180 days, `false` | See above |
@@ -80,5 +80,5 @@ dig +short DS safestreamdata.com
 dig +short TXT _dmarc.safestreamdata.com
 ```
 
-Then check the TLS grade at SSL Labs and that `https://www.safestreamdata.com` redirects to
-the apex.
+Then check the TLS grade at SSL Labs and that `https://docs.safestreamdata.com` serves the
+public site.

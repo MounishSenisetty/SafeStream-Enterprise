@@ -32,6 +32,10 @@ concurrency:
 env:
   CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
   TF_VAR_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  # Who Cloudflare Access lets through to the console: JSON lists in repository
+  # variables, e.g. CONSOLE_ALLOWED_EMAILS = ["you@example.com"]. Unset: nobody.
+  TF_VAR_console_allowed_emails: ${{ vars.CONSOLE_ALLOWED_EMAILS || '[]' }}
+  TF_VAR_console_allowed_email_domains: ${{ vars.CONSOLE_ALLOWED_EMAIL_DOMAINS || '[]' }}
   # R2 API token for the state bucket (S3-compatible credentials).
   AWS_ACCESS_KEY_ID: ${{ secrets.TFSTATE_R2_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.TFSTATE_R2_SECRET_ACCESS_KEY }}
