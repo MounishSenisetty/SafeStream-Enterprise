@@ -12,7 +12,7 @@ locals {
   # Universal SSL certificate covers both.
   api_hosts     = ["api.${var.zone_name}", "api-staging.${var.zone_name}"]
   api_host_expr = "http.host in {${join(" ", formatlist("\"%s\"", local.api_hosts))}}"
-  www_host      = "www.${var.zone_name}"
+  site_host     = "docs.${var.zone_name}"
 }
 
 # DNSSEC. With Cloudflare as registrar the DS record is published automatically.

@@ -54,14 +54,12 @@ resource "cloudflare_dns_record" "dmarc" {
 }
 
 # ---------------------------------------------------------------------------
-# Website (Cloudflare Pages). Proxied CNAMEs: the apex is flattened by Cloudflare.
+# Website (Cloudflare Pages), on docs.: a proxied CNAME to the Pages project.
 # ---------------------------------------------------------------------------
 
 resource "cloudflare_dns_record" "site" {
-  for_each = toset([var.zone_name, local.www_host])
-
   zone_id = local.zone_id
-  name    = each.key
+  name    = local.site_host
   type    = "CNAME"
   ttl     = 1 # automatic; required for proxied records
   content = cloudflare_pages_project.site.subdomain

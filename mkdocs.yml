@@ -1,7 +1,7 @@
-# The public site (https://safestreamdata.com): landing page and documentation.
+# The public site (https://docs.safestreamdata.com): landing page and documentation.
 #   pip install -e ".[docs]" && mkdocs serve
 site_name: SafeStream Enterprise
-site_url: https://safestreamdata.com/
+site_url: https://docs.safestreamdata.com/
 site_description: >-
   Redact personal data, payment data and credentials from Kafka and data-lake
   streams in flight, inside your own network.
